@@ -8,7 +8,15 @@ This code is distributed without an pre-build binary. Therefore it is necessary 
 
 See following command to perform out-of-source build (assume you have already cloned this directory and is located within the project root):
 
-### For MacOS & Linux Builds
+### For MacOS Builds
+
+```bash
+mkdir build
+cmake -S . -B build -G Xcode
+cmake --build build --config Release
+```
+
+### For Linux Builds
 
 ```bash
 mkdir build
