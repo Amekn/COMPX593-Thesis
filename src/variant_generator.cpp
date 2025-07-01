@@ -1,15 +1,3 @@
-// variant_generator.cpp
-// A cross‑platform program to generate nucleotide variant sequences
-// Build with CMake ≥4.0: see CMakeLists.txt at bottom of file
-//
-// UPDATED 2025‑06‑30
-//   * Replaced <min_substitution> / <max_substitution> arguments with
-//     <variable_mutant_prob> / <framework_mutant_prob> (percent 0‑100).
-//   * Mutations are now applied independently to each nucleotide according
-//     to its region‑specific probability.
-//   * All other behaviour (length fluctuation, reverse‑complement option) is
-//     unchanged.
-
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -33,8 +21,8 @@ struct Region {
 // Native barcode lookup table (SQK‑NBD114.24, NB01‑NB24)
 // Each entry maps the barcode ID (e.g. "NB01") to a pair of
 // (forward_barcode, reverse_barcode) sequences.
-// Forward flanking: 5'‑AAGGTTAA‑barcode‑CAGCACCT‑3'
-// Reverse flanking: 5'‑GGTGCTG‑barcode‑TTAACCTTAGCAAT‑3'
+// Forward strand flanking: 5'‑AAGGTTAA‑barcode‑CAGCACCT‑3'
+// Reverse complement strand flanking: 5'‑GGTGCTG‑barcode‑TTAACCTTAGCAAT‑3'
 // ──────────────────────────────────────────────────────────────────────────────
 static const unordered_map<string, pair<string,string>> BARCODE_SEQS = {
     {"NB01", {"CACAAAGACACCGACAACTTTCTT", "AAGAAAGTTGTCGGTGTCTTTGTG"}},
@@ -63,12 +51,8 @@ static const unordered_map<string, pair<string,string>> BARCODE_SEQS = {
     {"NB24", {"GCATAGTTCTGCATGATGGGTTAG", "CTAACCCATCATGCAGAACTATGC"}}
 };
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Helper utilities
-// ──────────────────────────────────────────────────────────────────────────────
-
-// Read first sequence from FASTA. Returns sequence; sets header (without '>')
-string read_fasta(const string &path, string &header) {
+// Read first sequence from FASTA. Returns sequence; set sequence name
+static string read_fasta(const string &path, string &sequence_name) {
     ifstream in(path);
     if (!in)
         throw runtime_error("Cannot open reference FASTA: " + path);
@@ -77,18 +61,18 @@ string read_fasta(const string &path, string &header) {
         if (line.empty())
             continue;
         if (line[0] == '>') {
-            header = line.substr(1);
+            sequence_name = line.substr(1);
         } else {
             seq += line;
         }
     }
-    if (header.empty() || seq.empty())
+    if (sequence_name.empty() || seq.empty())
         throw runtime_error("Invalid FASTA: " + path);
     return seq;
 }
 
 // Read region declaration file (CSV: start,end), return allowed mutable positions
-vector<size_t> read_regions(const std::string &path, size_t ref_len) {
+static vector<size_t> read_regions(const string &path, size_t ref_len) {
     ifstream in(path);
     if (!in)
         throw runtime_error("Cannot open region file: " + path);
@@ -102,7 +86,7 @@ vector<size_t> read_regions(const std::string &path, size_t ref_len) {
             throw runtime_error("Region line missing comma: " + line);
         size_t start = stoul(line.substr(0, comma));
         size_t end   = stoul(line.substr(comma + 1));
-
+        
         if (start >= end)
             throw runtime_error("Region end must be > start: " + line);
         if (end > ref_len)
@@ -114,7 +98,7 @@ vector<size_t> read_regions(const std::string &path, size_t ref_len) {
     return allowed;
 }
 
-char random_base(char exclude, mt19937 &rng) {
+static char random_base(char exclude, mt19937 &rng) {
     static const char bases[] = {'A', 'C', 'G', 'T'};
     uniform_int_distribution<int> dist(0, 3);
     char b;
@@ -124,7 +108,7 @@ char random_base(char exclude, mt19937 &rng) {
     return b;
 }
 
-string random_bases(size_t n, mt19937 &rng) {
+static string random_bases(size_t n, mt19937 &rng) {
     static const char bases[] = {'A', 'C', 'G', 'T'};
     uniform_int_distribution<int> dist(0, 3);
     string s;
@@ -134,11 +118,7 @@ string random_bases(size_t n, mt19937 &rng) {
     return s;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Reverse‑complement helper
-// ──────────────────────────────────────────────────────────────────────────────
-
-inline char comp(char b) {
+static inline char comp(char b) {
     switch (toupper(b)) {
         case 'A': return 'T';
         case 'C': return 'G';
@@ -148,7 +128,7 @@ inline char comp(char b) {
     }
 }
 
-string reverse_complement(const string &seq) {
+static string reverse_complement(const string &seq) {
     string rc;
     rc.reserve(seq.size());
     for (auto it = seq.rbegin(); it != seq.rend(); ++it)
@@ -161,7 +141,7 @@ string reverse_complement(const string &seq) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 int main(int argc, char *argv[]) {
-    // Expected arguments (8 or more):
+    // Expected arguments:
     //   1  <variable_mutant_prob>   (0‑100)
     //   2  <framework_mutant_prob>  (0‑100)
     //   3  <max_length_flunctuation>
@@ -169,10 +149,11 @@ int main(int argc, char *argv[]) {
     //   5  <region_file>
     //   6  <reference_fasta>
     //   7  <output_fasta>
-    //   8+ [--barcode|-b NBxx] [--revcomp|-r]  (optional)
+    //   8 [--barcode|-b] (optional)
+    //   9 [--revcomp|-r]  (optional)
 
     bool revcomp_flag  = false;
-    bool barcode_flag  = false;   // set when --barcode/-b is present
+    bool barcode_flag  = false;   
 
     // ------------------------------------------------------------------
     // Parse positional arguments (first 7 arguments are mandatory)
@@ -198,10 +179,13 @@ int main(int argc, char *argv[]) {
     for (int i = 8; i < argc; ++i) {
         string flag = argv[i];
         if (flag == "--revcomp" || flag == "-r") {
+            //Produces variant in reverse complement
             revcomp_flag = true;
         } else if (flag == "--barcode" || flag == "-b") {
-            barcode_flag = true;           // enable cycling through all barcodes
+            //Produces variant by looping through all barcodes
+            barcode_flag = true;         
         } else {
+            //If any unknow flag is capture, print an error message.
             cerr << "Unknown flag: " << flag << '\n';
             return 1;
         }
@@ -212,10 +196,10 @@ int main(int argc, char *argv[]) {
     all_barcode_ids.reserve(BARCODE_SEQS.size());
     for (const auto &kv : BARCODE_SEQS)
         all_barcode_ids.push_back(kv.first);
-    std::sort(all_barcode_ids.begin(), all_barcode_ids.end());   // NB01 .. NB24
+    sort(all_barcode_ids.begin(), all_barcode_ids.end());   // NB01 .. NB24
 
-
-    if (var_prob > 100 || fw_prob > 100) {
+    // Check to ensure mutation probability is within the range.
+    if (var_prob < 0 || fw_prob < 0 || var_prob > 100 || fw_prob > 100) {
         cerr << "Mutation probabilities must be in the range 0‑100\n";
         return 1;
     }
