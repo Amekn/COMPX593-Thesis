@@ -14,7 +14,7 @@ Options:
     -c, --convert   Convert Phred Q-scores into accuracy percentages via:
                     accuracy = (1 - 10**(-Q/10)) * 100
 
-If --convert is not set, the script treats the Q-scores as fractions of 1 and multiplies by 100.
+If --convert is not set, the script simply reports the mean Q‑score.
 """
 import argparse
 import sys
@@ -56,14 +56,14 @@ def main():
         sys.exit(1)
 
     if args.convert:
-        # Phred to accuracy
-        accuracies = (1 - 10 ** (-qvals / 10)) * 100
-        mean_pct = accuracies.mean()
-        print(f"Mean accuracy percentage based on '{col_name}': {mean_pct:.2f}%")
+        # Compute accuracy from the **mean** Q‑score
+        mean_q = qvals.mean()
+        mean_pct = (1 - 10 ** (-mean_q / 10)) * 100
+        print(f"Mean accuracy percentage based on mean Q‑score ({mean_q:.2f}): {mean_pct:.2f}%")
     else:
-        # Treat as fraction of 1 -> percentage
-        mean_pct = qvals.mean() * 100
-        print(f"Mean of '{col_name}' as percentage: {mean_pct:.2f}%")
+        # Report the mean Q‑score directly
+        mean_q = qvals.mean()
+        print(f"Mean Q‑score of '{col_name}': {mean_q:.2f}")
 
 if __name__ == '__main__':
     main()
