@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-compute_mean_qscore_template_percentage.py
+Compute MQAAR (Mean Q-score Across All Read) on .tsv report generated from basecalled reads (i.e., dorado summary)
 
 Script to compute the average of the 'mean_qscore_template' column as a percentage for all sequences
 in a Nanopore summary TSV file.
 
 Usage:
-    python compute_mean_qscore_template_percentage.py <report_file> [--convert]
+    python compute_mean_qscore_template_percentage.py <report_file> [-c|--convert]
 
 Arguments:
     report_file: Path to the TSV report file with a header that includes 'mean_qscore_template'.
+    
 Options:
     -c, --convert   Convert Phred Q-scores into accuracy percentages via:
                     accuracy = (1 - 10**(-Q/10)) * 100

@@ -2,6 +2,7 @@
 import os
 import argparse
 import pod5
+import uuid
 from dataclasses import replace
 
 # -----------------------------------------------------------------------------
@@ -34,29 +35,34 @@ def main():
     args = parse_args()
     input_pod5  = args.inputfile
     if not os.path.isfile(input_pod5):
-        raise argparse.ArgumentError(f"The file '{input_pod5}' does not exist.")
+        raise argparse.ArgumentError(f"The file '{input_pod5}' does not exist.") # type: ignore
     output_pod5 = args.outputfile
 
-    # Open the output POD5 for writing
-    with pod5.Writer(output_pod5) as writer:
-        # Open the input POD5 for reading
-        with pod5.Reader(input_pod5) as reader:
-            for record in reader:
-                read = record.to_read()  # Convert immutable record → mutable Read
+    # Open the input POD5 for reading
+    with pod5.Reader(input_pod5) as reader, pod5.Writer(output_pod5) as writer:
+        for record in reader:
+            read = record.to_read()  # Convert immutable record → mutable Read
 
-                # -----------------------------------------------------------------
-                # Populate missing run_info fields so Dorado can basecall properly
-                # -----------------------------------------------------------------
-                updated_info = replace(
-                    read.run_info,
-                    flow_cell_product_code=FLOWCELL_CODE,   # :contentReference[oaicite:8]{index=8}
-                    sample_id=SAMPLE_ID
-                )
-                read.run_info = updated_info
+            # -----------------------------------------------------------------
+            # Populate missing run_info fields so Dorado can basecall properly
+            # -----------------------------------------------------------------
+            tracking = dict(getattr(read.run_info, "tracking_id", {}) or {})
+            tracking["run_id"] = str(uuid.uuid4())
+            tracking.setdefault("exp_start_time", "0.0")
+            ctx = dict(getattr(read.run_info, "context_tags", {}) or {})
+            ctx["sample_frequency"] = "5000"
+            updated_info = replace(
+                read.run_info,
+                flow_cell_product_code=FLOWCELL_CODE,   # :contentReference[oaicite:8]{index=8}
+                sample_id=SAMPLE_ID,
+                tracking_id=tracking,
+                context_tags=ctx
+            )
+            read.run_info = updated_info
 
-                # Write the edited read to the output POD5
-                writer.add_read(read)
-
+            # Write the edited read to the output POD5
+            writer.add_read(read)
     print(f"✓ Finished processing. Output POD5 written to: {output_pod5}")
+
 if __name__ == "__main__":
     main()

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Merge Bonito-style training arrays from multiple folders, **without** loading
 all arrays into RAM at once, with progress bars and ETA.
