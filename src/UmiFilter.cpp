@@ -91,7 +91,6 @@ int main(int argc, char** argv) {
 
     cerr << "[umi_dedupe] total=" << total
          << " kept=" << kept
-         << " dropped_dupe=" << dropped
-         << " kept_no_umi=" << kept << "\n";
+         << " dropped=" << dropped << "\n";
     return 0;
 }
