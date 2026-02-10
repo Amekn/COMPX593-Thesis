@@ -11,12 +11,16 @@ static inline char up(char c) {
 }
 
 static string extract_umi(const string& header) {
-    const string tag = "|UMI:";
+    const string tag = ":UMI_";
     size_t pos = header.find(tag);
     if (pos == string::npos) return string();
+
     size_t start = pos + tag.size();
-    size_t end_bar = header.find('|', start);
-    string umi = (end_bar == string::npos) ? header.substr(start) : header.substr(start, end_bar - start);
+    if (start >= header.size()) return string();
+
+    size_t end = header.find_first_of(" \t\r\n", start);
+    string umi = (end == string::npos) ? header.substr(start) : header.substr(start, end - start);
+
     for (char& c : umi) c = up(c);
     return umi;
 }
@@ -50,11 +54,11 @@ int main(int argc, char** argv) {
 
     // Reserve a big-ish set to reduce rehashing if you expect many UMIs.
     unordered_set<string> seen;
-    seen.reserve(1 << 17); // ~100k buckets; adjust to your scale
+    seen.reserve(1 << 22); // ~4m brackets; adjust to your scale
     int total = 0, kept = 0, dropped=0;
 
     FastqRecord r;
-    r.h.reserve(256); r.s.reserve(1024); r.p.reserve(4); r.q.reserve(1024);
+    r.h.reserve(128); r.s.reserve(1024); r.p.reserve(4); r.q.reserve(1024);
 
     while (true) {
         if (!getline(in, r.h)) break;            // EOF ok here
@@ -89,7 +93,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    cerr << "[umi_dedupe] total=" << total
+    cerr << "[UmiFilter] total=" << total
          << " kept=" << kept
          << " dropped=" << dropped << "\n";
     return 0;

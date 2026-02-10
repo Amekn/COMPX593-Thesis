@@ -49,9 +49,9 @@ int main(int argc, char* argv[]){
         }
         if (header.empty()) break; // EOF
 
-        // Extract ID: from position after '@' to first '|
+        // Extract ID: from position after '@' to first ':'
         size_t start = 1; //Skip '@'
-        size_t end = header.find_first_of("|", start);
+        size_t end = header.find_first_of(":", start);
         if(end <= start){
             // Malformed header, skip
         } else {

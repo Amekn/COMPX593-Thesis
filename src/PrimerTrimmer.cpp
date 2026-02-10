@@ -1,3 +1,19 @@
+/*
+Usage: PrimerTrimmer <input.fastq> <output.fastq> <forward_primer> <reverse_primer> <max_mismatch>
+    input.fastq: Input FASTQ file
+    output.fastq: Output FASTQ file
+    forward_primer: Forward primer sequence (IUPAC allowed) 
+    reverse_primer: Reverse primer sequence (IUPAC allowed)
+    max_mismatch: Maximum number of mismatches allowed in primer matching
+
+Description: 
+    This program processes FASTQ files to trim both end of the reads based on provided forward and reverse primer sequences.
+    The sequences beyond the primer sequence are trimed (each post-processed sequence must start with a primer and ends with a primer)
+    A certain number of mismatches are allowed when matching primers.
+    IPUAC codes are supported in primer sequences.
+    All reverse read strands are converted to forward strands.
+*/
+
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -9,9 +25,6 @@
 
 using namespace std;
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Utility helpers
-// ──────────────────────────────────────────────────────────────────────────────
 static uint8_t IUPAC_bits[256];
 static char IUPAC_comp[256];
 
@@ -66,9 +79,7 @@ static string reverse_quality(const string &qual)
     }
     return out;
 }
-// ──────────────────────────────────────────────────────────────────────────────
-// FASTQ I/O
-// ──────────────────────────────────────────────────────────────────────────────
+
 struct FastqRecord
 {
     string id;
@@ -129,10 +140,6 @@ private:
     std::ofstream out_;
 };
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Processors
-// ──────────────────────────────────────────────────────────────────────────────
-// Initiate IUPAC bitmasks and complements
 static void init_iupac()
 {
     auto set_code = [](char c, const char *allowed)
@@ -210,6 +217,7 @@ static inline bool iupac_match_leq_mismatches(const string &read_seq, int start,
         char p = up(primer[i]);
         uint8_t allowed = IUPAC_bits[static_cast<unsigned char>(p)];
         uint8_t rb = base_bit(r);
+        // 1. If the nucleotide in the sequence is allowed at given primer position then match, else mismatch.
         if ((rb & allowed) == 0)
         {
             if (++mm > max_mismatch)
@@ -224,13 +232,17 @@ static int find_from_start(const string &read_seq, const string &primer, int max
 {
     int L = (int)primer.size();
     int R = (int)read_seq.size();
+    // 1. Primer cannot be longer than sequence
     if (L > R)
         return -1;
+    // 2. Slide window search from the beginning of the read
     for (int i = 0; i <= R - L; ++i)
-    {
+    {   
+        // 3. Check the number of mismatches in the current window
         if (iupac_match_leq_mismatches(read_seq, i, primer, max_mismatch))
             return i;
     }
+    // 4. No match found
     return -1;
 }
 
@@ -241,6 +253,7 @@ static int find_from_end(const string &read_seq, const string &primer, int max_m
     int R = (int)read_seq.size();
     if (L > R)
         return -1;
+    // 2. Slide window search from the end of the read
     for (int i = R - L; i >= 0; --i)
     {
         if (iupac_match_leq_mismatches(read_seq, i, primer, max_mismatch))
@@ -271,92 +284,56 @@ static bool process_record(
     FastqRecord &rec,
     const string &fwd, const string &rev,
     const string &fwd_rc, const string &rev_rc,
-    int max_mismatch,
-    const vector<int> &f_umi_pos,
-    const vector<int> &r_umi_pos,
-    const vector<int> &frc_umi_pos,
-    const vector<int> &rrc_umi_pos)
+    int max_mismatch)
 {
+    // Copy & Uppercase each nucleotides in the sequence
     string seq = rec.seq;
     for (char &c : seq)
         c = up(c);
 
+    // Retrieve the size of forward & reverse primers
     const int Lf = (int)fwd.size();
     const int Lr = (int)rev.size();
-    if(f_umi_pos.empty() || r_umi_pos.empty() || frc_umi_pos.empty() || rrc_umi_pos.empty())
-        return false; // No UMI positions found
-    // Orientation A: F ... rc(R)
-    // Forward strand
+
+    // If read is a forward strand then: F ... rc(R)
     {
         int left_idx = find_from_start(seq, fwd, max_mismatch);
         int right_idx = find_from_end(seq, rev_rc, max_mismatch);
         if (left_idx >= 0 && right_idx >= 0 && left_idx + Lf <= right_idx)
         {
-            string start_region = seq.substr(left_idx, Lf);
-            string end_region = seq.substr(right_idx, Lr);
-            string umi1 = extract_umi_from_region(start_region, f_umi_pos);
-            string umi2 = extract_umi_from_region(end_region, rrc_umi_pos);
-            rec.id += ":UMI_" + umi1 + "_" + umi2;
-            int left_end = left_idx + f_umi_pos.back() + 1;
-            int extend_length = right_idx - left_end + rrc_umi_pos.front();
-            rec.seq = rec.seq.substr(left_end, extend_length);
-            rec.qual = rec.qual.substr(left_end, extend_length);
+            int extend_length = right_idx - left_idx + Lr;
+            rec.seq = rec.seq.substr(left_idx, extend_length);
+            rec.qual = rec.qual.substr(left_idx, extend_length);
             return true;
         }
     }
-    // Orientation B: R ... rc(F)
-    // Reverse strand
+    // If read is a reverse strand then: R ... rc(F)
     {
         int left_idx = find_from_start(seq, rev, max_mismatch);
         int right_idx = find_from_end(seq, fwd_rc, max_mismatch);
         if (left_idx >= 0 && right_idx >= 0 && left_idx + Lr <= right_idx)
         {
-            string start_region = seq.substr(left_idx, Lr);
-            string end_region = seq.substr(right_idx, Lf);
-            string umi1 = extract_umi_from_region(start_region, r_umi_pos);
-            string umi2 = extract_umi_from_region(end_region, frc_umi_pos);
-            // Reverse the UMI order for reverse strand
-            string temp = umi1;
-            umi1 = to_rc(umi2);
-            umi2 = to_rc(temp);
-            rec.id += ":UMI_" + umi1 + "_" + umi2;
-            // Reverse-complement the sequence and quality
-            string rc_seq = to_rc(rec.seq);
-            string rc_qual = reverse_quality(rec.qual);
-            int left_idx_rc = rc_seq.size() - (right_idx + Lf);
-            int right_idx_rc = rc_seq.size() - (left_idx + Lr);
-            int left_end = left_idx_rc + f_umi_pos.back() + 1;
-            int extend_length = right_idx_rc - left_end + rrc_umi_pos.front();
-            rec.seq = rc_seq.substr(left_end, extend_length);
-            rec.qual = rc_qual.substr(left_end, extend_length);
+            int extend_length = right_idx - left_idx + Lf;
+            rec.seq = to_rc(rec.seq.substr(left_idx, extend_length));
+            rec.qual = reverse_quality(rec.qual.substr(left_idx, extend_length));
             return true;
         }
     }
     return false;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// main
-// ──────────────────────────────────────────────────────────────────────────────
 int main(int argc, char **argv)
 {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    /*
-    * input.fastq: Input FASTQ file
-    * output.fastq: Output FASTQ file
-    * forward_primer: Forward primer sequence (IUPAC allowed)
-    * reverse_primer: Reverse primer sequence (IUPAC allowed)
-    * max_mismatch N: maximum allowed mismatches per primer
-    * reverse read will be transformed to forward read in output.fastq
-    */
     // Parse CLI args
-    if (argc != 6)
+    if (argc < 6)
     {
         cerr << "Usage: " << argv[0] << " <input.fastq> <output.fastq> <forward_primer> <reverse_primer> <max_mismatch>\n";
         exit(1);
     }
+
     const string in_fastq = argv[1];
     const string out_fastq = argv[2];
     string fwd = argv[3];
@@ -370,15 +347,12 @@ int main(int argc, char **argv)
     // Build IUPAC bit masks.
     init_iupac();
 
-    // Precompute reverse-complements and UMI positions
+    // Precompute reverse-complements
+    // Both standard nucleotide and ambiguous nucleotide are converted to their complements.
     const string fwd_rc = to_rc(fwd);
     const string rev_rc = to_rc(rev);
 
-    const vector<int> f_umi_pos = umi_mask(fwd);
-    const vector<int> r_umi_pos = umi_mask(rev);
-    const vector<int> frc_umi_pos = umi_mask(fwd_rc);
-    const vector<int> rrc_umi_pos = umi_mask(rev_rc);
-
+    // Read failed trim process will be dropped.   
     uint64_t n_total = 0, n_kept = 0, n_dropped = 0;
 
     try
@@ -396,8 +370,7 @@ int main(int argc, char **argv)
                 continue;
             }
             FastqRecord out = rec;
-            if (process_record(out, fwd, rev, fwd_rc, rev_rc, max_mismatch,
-                               f_umi_pos, r_umi_pos, frc_umi_pos, rrc_umi_pos))
+            if (process_record(out, fwd, rev, fwd_rc, rev_rc, max_mismatch))
             {
                 writer.write(out);
                 ++n_kept;
@@ -408,10 +381,9 @@ int main(int argc, char **argv)
             }
         }
 
-        std::cerr << "[UmiExtractor] total=" << n_total
+        std::cerr << "[PrimerTrimmer] total=" << n_total
                   << " kept=" << n_kept
-                  << " dropped=" << n_dropped
-                  << " (mismatches per primer <= " << max_mismatch << ")\n";
+                  << " dropped=" << n_dropped << "\n";
     }
     catch (const std::exception &e)
     {
