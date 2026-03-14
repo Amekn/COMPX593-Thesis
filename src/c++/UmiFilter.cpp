@@ -1,100 +1,73 @@
-#include <iostream>
-#include <fstream>
-#include <string>
 #include <cstdint>
+#include <iostream>
+#include <string>
 #include <unordered_set>
 
-using namespace std;
+#include "ont_tools/Fastq.hpp"
+#include "ont_tools/Umi.hpp"
 
-static inline char up(char c) {
-    return static_cast<char>(toupper(static_cast<unsigned char>(c)));
+namespace {
+
+void PrintUsage(const char* program_name) {
+    std::cerr
+        << "Usage: " << program_name << " <input.fastq> <output.fastq>\n\n"
+        << "Keep only the first read observed for each UMI key in the FASTQ header.\n";
 }
 
-static string extract_umi(const string& header) {
-    const string tag = ":UMI_";
-    size_t pos = header.find(tag);
-    if (pos == string::npos) return string();
-
-    size_t start = pos + tag.size();
-    if (start >= header.size()) return string();
-
-    size_t end = header.find_first_of(" \t\r\n", start);
-    string umi = (end == string::npos) ? header.substr(start) : header.substr(start, end - start);
-
-    for (char& c : umi) c = up(c);
-    return umi;
-}
-
-struct FastqRecord {
-    string h, s, p, q; // header, seq, plus, qual
-};
+}  // namespace
 
 int main(int argc, char** argv) {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
 
-    if (argc < 3) {
-        cerr << "Usage: " << argv[0]
-             << " <input.fastq> <output.fastq>\n";
+    if (argc != 3) {
+        PrintUsage(argv[0]);
         return 1;
     }
-    const string input_fastq  = argv[1];
-    const string output_fastq = argv[2];
 
-    ifstream in(input_fastq);
-    if (!in) {
-        cerr << "ERROR: cannot open input: " << input_fastq << "\n";
+    const std::string input_fastq = argv[1];
+    const std::string output_fastq = argv[2];
+
+    std::unordered_set<std::string> seen_umi_keys;
+    seen_umi_keys.reserve(1U << 22);
+
+    std::uint64_t total_reads = 0;
+    std::uint64_t kept_reads = 0;
+    std::uint64_t duplicate_umi_reads = 0;
+    std::uint64_t missing_umi_reads = 0;
+
+    try {
+        ont::fastq::Reader reader(input_fastq);
+        ont::fastq::Writer writer(output_fastq);
+
+        ont::fastq::Record record;
+        while (reader.Next(record)) {
+            ++total_reads;
+
+            std::string umi_key;
+            try {
+                umi_key = ont::umi::ParseSingleKey(record.header);
+            } catch (const std::exception&) {
+                ++missing_umi_reads;
+                continue;
+            }
+
+            const auto [_, inserted] = seen_umi_keys.insert(std::move(umi_key));
+            if (inserted) {
+                writer.Write(record);
+                ++kept_reads;
+            } else {
+                ++duplicate_umi_reads;
+            }
+        }
+    } catch (const std::exception& exception) {
+        std::cerr << "Error: " << exception.what() << "\n";
         return 2;
     }
-    ofstream out(output_fastq);
-    if (!out) {
-        cerr << "ERROR: cannot open output: " << output_fastq << "\n";
-        return 2;
-    }
 
-    // Reserve a big-ish set to reduce rehashing if you expect many UMIs.
-    unordered_set<string> seen;
-    seen.reserve(1 << 22); // ~4m brackets; adjust to your scale
-    int total = 0, kept = 0, dropped=0;
-
-    FastqRecord r;
-    r.h.reserve(128); r.s.reserve(1024); r.p.reserve(4); r.q.reserve(1024);
-
-    while (true) {
-        if (!getline(in, r.h)) break;            // EOF ok here
-        if (!getline(in, r.s) || !getline(in, r.p) || !getline(in, r.q)) {
-            cerr << "ERROR: truncated FASTQ near record " << (total + 1) << "\n";
-            return 3;
-        }
-        ++total;
-
-        // Minimal FASTQ sanity check
-        if (r.h.empty() || r.h[0] != '@' || r.p.empty() || r.p[0] != '+') {
-            cerr << "WARN: malformed FASTQ record at " << total << "\n";
-        }
-        if (r.s.size() != r.q.size()) {
-            continue;
-        }
-
-        string umi = extract_umi(r.h);
-        if (umi.empty()) {
-            ++dropped;
-            continue;
-        }
-
-        auto [it, inserted] = seen.insert(move(umi));
-        if (inserted) {
-            // First time seeing this UMI => keep
-            out << r.h << '\n' << r.s << '\n' << r.p << '\n' << r.q << '\n';
-            ++kept;
-        } else {
-            // Duplicate UMI => drop
-            ++dropped;
-        }
-    }
-
-    cerr << "[UmiFilter] total=" << total
-         << " kept=" << kept
-         << " dropped=" << dropped << "\n";
+    std::cerr << "[UmiFilter] total=" << total_reads
+              << " kept=" << kept_reads
+              << " duplicate_umi_reads=" << duplicate_umi_reads
+              << " missing_umi_reads=" << missing_umi_reads << "\n";
     return 0;
 }

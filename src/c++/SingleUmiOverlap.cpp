@@ -1,133 +1,99 @@
-#include <algorithm>
-#include <cctype>
 #include <cstdint>
-#include <fstream>
 #include <iostream>
-#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
-using namespace std;
+#include "ont_tools/Fastq.hpp"
+#include "ont_tools/Umi.hpp"
 
-static inline void trim_cr(string& s) {
-    if (!s.empty() && s.back() == '\r') s.pop_back();
+namespace {
+
+void PrintUsage(const char* program_name) {
+    std::cerr
+        << "Usage: " << program_name << " <fastq1> <fastq2>\n\n"
+        << "Summarise read-level and unique-key overlap between two single-UMI FASTQ files.\n";
 }
 
-static bool read_fastq_record(istream& in, string& header, string& seq, string& plus, string& qual) {
-    header.clear(); seq.clear(); plus.clear(); qual.clear();
+struct OverlapSummary {
+    std::uint64_t read_count = 0;
+    std::unordered_set<std::string> umi_keys;
+};
 
-    if (!std::getline(in, header)) return false;
-    if (!std::getline(in, seq))    throw runtime_error("Malformed FASTQ: missing sequence line");
-    if (!std::getline(in, plus))   throw runtime_error("Malformed FASTQ: missing '+' line");
-    if (!std::getline(in, qual))   throw runtime_error("Malformed FASTQ: missing quality line");
+OverlapSummary LoadSingleUmiFile(const std::string& fastq_path) {
+    OverlapSummary summary;
+    summary.umi_keys.reserve(3'000'000);
+    summary.umi_keys.max_load_factor(0.70F);
 
-    trim_cr(header); trim_cr(seq); trim_cr(plus); trim_cr(qual);
-
-    if (header.empty() || header[0] != '@')
-        throw runtime_error("Malformed FASTQ: header does not start with '@': " + header);
-    if (plus.empty() || plus[0] != '+')
-        throw runtime_error("Malformed FASTQ: third line does not start with '+': " + plus);
-    if (seq.size() != qual.size())
-        throw runtime_error("Malformed FASTQ: sequence and quality lengths differ: " +
-                            to_string(seq.size()) + " vs " + to_string(qual.size()));
-    return true;
-}
-
-// Extract the UMI code after ":UMI_" up to whitespace.
-// Returns UMI code only (not including ":UMI_"), normalized to uppercase.
-static string parse_umi_code(const string& header_line) {
-    static constexpr const char* TAG = ":UMI_";
-    const size_t tag_pos = header_line.find(TAG);
-    if (tag_pos == string::npos) {
-        throw runtime_error("Header missing ':UMI_' tag: " + header_line);
+    ont::fastq::Reader reader(fastq_path);
+    ont::fastq::Record record;
+    while (reader.Next(record)) {
+        ++summary.read_count;
+        summary.umi_keys.insert(ont::umi::ParseSingleKey(record.header));
     }
 
-    const size_t start = tag_pos + std::char_traits<char>::length(TAG);
-    size_t end = header_line.find_first_of(" \t\r\n", start);
-    if (end == string::npos) end = header_line.size();
-
-    if (end <= start) {
-        throw runtime_error("Empty UMI after ':UMI_' tag in header: " + header_line);
-    }
-
-    string umi = header_line.substr(start, end - start);
-    for (char& c : umi) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
-    return umi;
+    return summary;
 }
+
+}  // namespace
 
 int main(int argc, char** argv) {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    if (argc != 3) {
+        PrintUsage(argv[0]);
+        return 1;
+    }
 
     try {
-        if (argc != 3) {
-            cerr << "Usage: " << argv[0] << " <fastq1> <fastq2>\n";
-            return 1;
-        }
+        const OverlapSummary first_summary = LoadSingleUmiFile(argv[1]);
+        const OverlapSummary second_summary = LoadSingleUmiFile(argv[2]);
 
-        const string fastq1 = argv[1];
-        const string fastq2 = argv[2];
+        std::unordered_set<std::string> seen_in_second_file;
+        seen_in_second_file.reserve(3'000'000);
+        seen_in_second_file.max_load_factor(0.70F);
 
-        ifstream in1(fastq1);
-        if (!in1) throw runtime_error("Failed to open FASTQ1: " + fastq1);
+        ont::fastq::Reader second_reader(argv[2]);
+        ont::fastq::Record record;
 
-        unordered_set<string> umis1;
-        umis1.reserve(3'000'000);
-        umis1.max_load_factor(0.70f);
+        std::uint64_t overlapping_reads_in_second_file = 0;
+        std::uint64_t second_only_unique_umis = 0;
+        std::uint64_t overlapping_unique_umis = 0;
 
-        string h, s, p, q;
-        uint64_t fastq1_reads = 0;
+        while (second_reader.Next(record)) {
+            const std::string umi_key = ont::umi::ParseSingleKey(record.header);
+            const bool present_in_first_file =
+                first_summary.umi_keys.find(umi_key) != first_summary.umi_keys.end();
+            if (present_in_first_file) {
+                ++overlapping_reads_in_second_file;
+            }
 
-        while (read_fastq_record(in1, h, s, p, q)) {
-            ++fastq1_reads;
-            umis1.insert(parse_umi_code(h));
-        }
-
-        ifstream in2(fastq2);
-        if (!in2) throw runtime_error("Failed to open FASTQ2: " + fastq2);
-
-        unordered_set<string> seen2; // to count unique UMIs in FASTQ2
-        seen2.reserve(3'000'000);
-        seen2.max_load_factor(0.70f);
-
-        uint64_t fastq2_reads = 0;
-        uint64_t overlap_reads_in_fastq2 = 0;
-
-        uint64_t fastq2_unique_umis_only = 0; // unique UMIs present only in FASTQ2
-        uint64_t overlapping_unique_umis = 0; // unique UMIs in intersection
-
-        while (read_fastq_record(in2, h, s, p, q)) {
-            ++fastq2_reads;
-            const string umi = parse_umi_code(h);
-
-            const bool in_fastq1 = (umis1.find(umi) != umis1.end());
-            if (in_fastq1) ++overlap_reads_in_fastq2;
-
-            // Count unique UMIs in FASTQ2 exactly once
-            if (seen2.insert(umi).second) {
-                if (in_fastq1) ++overlapping_unique_umis;
-                else ++fastq2_unique_umis_only;
+            if (seen_in_second_file.insert(umi_key).second) {
+                if (present_in_first_file) {
+                    ++overlapping_unique_umis;
+                } else {
+                    ++second_only_unique_umis;
+                }
             }
         }
 
-        const uint64_t fastq1_unique_umis = umis1.size();
-        const uint64_t fastq1_unique_umis_only =
-            (fastq1_unique_umis >= overlapping_unique_umis)
-                ? (fastq1_unique_umis - overlapping_unique_umis)
-                : 0; // defensive, should never happen now
+        const std::uint64_t first_only_unique_umis =
+            first_summary.umi_keys.size() >= overlapping_unique_umis
+                ? first_summary.umi_keys.size() - overlapping_unique_umis
+                : 0;
 
-        cout
-            << "FASTQ1_Reads=" << fastq1_reads
-            << " FASTQ2_Reads=" << fastq2_reads
-            << " FASTQ1_UniqueUMIs=" << fastq1_unique_umis
-            << " FASTQ2_UniqueUMIsOnly=" << fastq2_unique_umis_only
-            << " Overlapping_UniqueUMIs=" << overlapping_unique_umis
-            << " FASTQ2_OverlapReads=" << overlap_reads_in_fastq2
-            << "\n";
-
-        return 0;
-    } catch (const exception& e) {
-        cerr << "Error: " << e.what() << "\n";
+        std::cout << "FASTQ1_Reads=" << first_summary.read_count
+                  << " FASTQ2_Reads=" << second_summary.read_count
+                  << " FASTQ1_UniqueUMIs=" << first_summary.umi_keys.size()
+                  << " FASTQ1_UniqueUMIsOnly=" << first_only_unique_umis
+                  << " FASTQ2_UniqueUMIsOnly=" << second_only_unique_umis
+                  << " Overlapping_UniqueUMIs=" << overlapping_unique_umis
+                  << " FASTQ2_OverlapReads=" << overlapping_reads_in_second_file
+                  << "\n";
+    } catch (const std::exception& exception) {
+        std::cerr << "Error: " << exception.what() << "\n";
         return 2;
     }
+
+    return 0;
 }

@@ -1,144 +1,83 @@
-/*
-Usage: UmiCloner <umi_fastq> <source_fastq> <destination_fastq>
-Description:
-    For fastq records in umi_fastq (with UMI in header), find matching records (by read_id) in source_fastq,
-    take the header (with UMI) from umi_fastq and sequence/quality from source_fastq, and write to destination_fastq.
-Author: Kang Zhou
-*/
-
-#include <iostream>
-#include <fstream>
-#include <string>
 #include <cstdint>
+#include <iostream>
+#include <string>
 #include <unordered_map>
-#include <cctype>
 
-using namespace std;
+#include "ont_tools/Fastq.hpp"
+#include "ont_tools/Umi.hpp"
 
-static inline char up(char c) {
-    return static_cast<char>(toupper(static_cast<unsigned char>(c)));
+namespace {
+
+void PrintUsage(const char* program_name) {
+    std::cerr
+        << "Usage: " << program_name << " <umi_fastq> <source_fastq> <destination_fastq>\n\n"
+        << "Copy UMI-enriched headers from the first FASTQ onto matching reads from the second FASTQ.\n"
+        << "Read matching is performed on the FASTQ read name, independent of any appended UMI tag.\n";
 }
 
-// Extract read id: drop '@', take first token, then split at ':' if present
-static string extract_read_id(const string& header) {
-    size_t start = 0;
-    size_t end = header.find_first_of(":");
-    return (end == string::npos) ? string() : header.substr(start, end - start);
-}
-
-struct FastqRecord {
-    string header;
-    string sequence;
-    string plus;
-    string quality;
-};
-
-static bool read_fastq_record(istream& in, FastqRecord& r) {
-    if (!getline(in, r.header)) return false;
-    if (!getline(in, r.sequence)) return false;
-    if (!getline(in, r.plus)) return false;
-    if (!getline(in, r.quality)) return false;
-    return true;
-}
+}  // namespace
 
 int main(int argc, char** argv) {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
 
-    if (argc < 4) {
-        cerr << "Usage: " << argv[0]
-             << " <umi_fastq> <source_fastq> <destination_fastq>\n";
+    if (argc != 4) {
+        PrintUsage(argv[0]);
         return 1;
     }
 
-    const string umi_fastq = argv[1];
-    const string source_fastq = argv[2];
-    const string destination_fastq = argv[3];
+    const std::string umi_fastq = argv[1];
+    const std::string source_fastq = argv[2];
+    const std::string destination_fastq = argv[3];
 
-    ifstream umi_in(umi_fastq);
-    if (!umi_in) {
-        cerr << "ERROR: cannot open input: " << umi_fastq << "\n";
+    std::unordered_map<std::string, std::string> umi_header_by_read_name;
+    umi_header_by_read_name.reserve(1U << 24);
+
+    std::uint64_t umi_records = 0;
+    std::uint64_t duplicate_umi_headers = 0;
+    std::uint64_t source_records = 0;
+    std::uint64_t cloned_records = 0;
+    std::uint64_t unmatched_records = 0;
+
+    try {
+        ont::fastq::Reader umi_reader(umi_fastq);
+        ont::fastq::Record record;
+        while (umi_reader.Next(record)) {
+            ++umi_records;
+            const std::string read_name = ont::umi::ExtractReadName(record.header);
+            const auto [_, inserted] = umi_header_by_read_name.emplace(read_name, record.header);
+            if (!inserted) {
+                ++duplicate_umi_headers;
+            }
+        }
+
+        ont::fastq::Reader source_reader(source_fastq);
+        ont::fastq::Writer destination_writer(destination_fastq);
+
+        ont::fastq::Record source_record;
+        while (source_reader.Next(source_record)) {
+            ++source_records;
+            const std::string read_name = ont::umi::ExtractReadName(source_record.header);
+            const auto match = umi_header_by_read_name.find(read_name);
+            if (match == umi_header_by_read_name.end()) {
+                ++unmatched_records;
+                continue;
+            }
+
+            ont::fastq::Record output_record = source_record;
+            output_record.header = match->second;
+            destination_writer.Write(output_record);
+            ++cloned_records;
+        }
+    } catch (const std::exception& exception) {
+        std::cerr << "Error: " << exception.what() << "\n";
         return 2;
     }
 
-    ifstream source_in(source_fastq);
-    if (!source_in) {
-        cerr << "ERROR: cannot open input: " << source_fastq << "\n";
-        return 2;
-    }
-
-    ofstream out(destination_fastq);
-    if (!out) {
-        cerr << "ERROR: cannot open output: " << destination_fastq << "\n";
-        return 2;
-    }
-
-    // read_id -> full header from umi_fastq (already contains UMI)
-    unordered_map<string, string> id_to_header_map;
-    id_to_header_map.reserve(1 << 24); // ~16 million entries
-
-    int umi_total = 0, source_total = 0;
-    int kept = 0, dropped = 0;
-
-    FastqRecord record;
-    record.header.reserve(128);
-    record.sequence.reserve(800);
-    record.plus.reserve(8);
-    record.quality.reserve(800);
-    string read_id;
-
-    // Load headers from umi_fastq
-    while (read_fastq_record(umi_in, record)) {
-        umi_total++;
-
-        if (record.header.empty() || record.header[0] != '@' ||
-            record.plus.empty() || record.plus[0] != '+') {
-            cerr << "ERROR: malformed FASTQ record in umi_fastq at record " << umi_total << "\n";
-            return 3;
-        }
-
-        if (record.sequence.size() != record.quality.size()) continue;
-
-        read_id = extract_read_id(record.header);
-
-        if (read_id.empty()) {
-            cerr << "ERROR: empty read_id in umi_fastq at record " << umi_total << "\n";
-            return 3;
-        }
-
-        // Store full header
-        id_to_header_map[read_id] = record.header;
-    }
-
-    // Stream through source_fastq and emit matched records
-    while (read_fastq_record(source_in, record)) {
-        source_total++;
-
-        if (record.header.empty() || record.header[0] != '@' ||
-            record.plus.empty() || record.plus[0] != '+') {
-            cerr << "ERROR: malformed FASTQ record in source_fastq at record " << source_total << "\n";
-            return 3;
-        }
-
-        if (record.sequence.size() != record.quality.size()) continue;
-
-        auto it = id_to_header_map.find(record.header);
-        if (it != id_to_header_map.end()) {
-            // Use header from umi_fastq, but seq/qual from source_fastq
-            out << it->second << '\n'
-                << record.sequence << '\n'
-                << record.plus << '\n'
-                << record.quality << '\n';
-            kept++;
-        } else {
-            dropped++;
-        }
-    }
-
-    cerr << "[UmiCloner] umi_total=" << umi_total
-         << " source_total=" << source_total
-         << " kept=" << kept
-         << " dropped=" << dropped << "\n";
-
+    std::cerr << "[UmiCloner] umi_records=" << umi_records
+              << " duplicate_umi_headers=" << duplicate_umi_headers
+              << " source_records=" << source_records
+              << " cloned_records=" << cloned_records
+              << " unmatched_records=" << unmatched_records << "\n";
     return 0;
 }

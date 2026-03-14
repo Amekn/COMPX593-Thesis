@@ -374,6 +374,7 @@ int main(int argc, char** argv) {
 
                 auto it = gt.find(key);
                 if (it == gt.end()) continue; // no ground-truth match for this UMI
+                hits++;
 
                 // Pass ground truth seq/qual and test seq to align_and_count
                 // This function updates S in place.

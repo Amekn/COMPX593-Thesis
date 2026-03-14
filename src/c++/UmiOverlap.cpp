@@ -1,141 +1,89 @@
-/*
-Usage: UmiOverlap <fastq1> <fastq2>
-Description:
-    Compute the number of overlapping UMIs between two FASTQ files.
-    Output:
-        Number of reads in FASTQ1
-        Number of reads in FASTQ2
-        Number of overlapping UMIs
-*/
-/*
-Usage: Benchmarker <ground_truth_fastq> <test_fastq1> <test_fastq2> ...
-
-Description:
-    Compares multiple FASTQ files containing processed nanopore reads against a ground truth illumina
-    reads FASTQ file. Outputs precision, recall, and F1-score for each test FASTQ file.
-
-    Each read in the ground_truth_fastq must contain dual UMI tags in the header
-    Each read in the test FASTQ file must contain dual UMI tags in the header (same format as ground truth)
-    A map is created from the ground truth FASTQ file using the dual UMI tags as keys.
-
-    Each read in the test FASTQ file is looked up in the map using the dual UMI tags.
-    If a match is found, the read sequences are compared to determine statistics of correctness.
-
-Important:
-    If a ground-truth quality character is '#', that reference position is IGNORED in match/sub/del totals.
-
-Output (TSV) columns for each test FASTQ:
-    Test FASTQ filename
-    Number of processed reads
-    Number of nucleotides compared
-    Number of matched nucleotides
-    Number of deleted nucleotides
-    Number of inserted nucleotides
-    Number of substituted nucleotides
-    Normalized Matched Nucleotides (matched / total)
-    Normalized Deletions (deletions / total)
-    Normalized Insertions (insertions / total)
-    Normalized Substitutions (substitutions / total)
-    Precision
-    Recall
-    F1-score
-
-Precision/Recall definition (nucleotide-level, alignment-based):
-    TP = matched
-    FP = substitutions + insertions
-    FN = substitutions + deletions
-    precision = TP / (TP + FP) = matched / (matched + subs + ins)
-    recall    = TP / (TP + FN) = matched / (matched + subs + del)
-*/
-#include <algorithm>
-#include <cctype>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
-#include <limits>
-#include <stdexcept>
 #include <string>
 #include <unordered_set>
-#include <vector>
 
-using namespace std;
+#include "ont_tools/Fastq.hpp"
+#include "ont_tools/Umi.hpp"
 
-static inline char up(char c) {
-    return static_cast<char>(toupper(static_cast<unsigned char>(c)));
+namespace {
+
+void PrintUsage(const char* program_name) {
+    std::cerr
+        << "Usage: " << program_name << " <fastq1> <fastq2>\n\n"
+        << "Report read counts and the overlap between the UMI key sets of two FASTQ files.\n";
 }
 
-static bool read_fastq_record(istream& in, string& header, string& seq, string& plus, string& qual) {
-    header.clear(); seq.clear(); plus.clear(); qual.clear();
-    if (!std::getline(in, header)) return false;
-    if (!std::getline(in, seq))    throw runtime_error("Malformed FASTQ: missing sequence line");
-    if (!std::getline(in, plus))   throw runtime_error("Malformed FASTQ: missing '+' line");
-    if (!std::getline(in, qual))   throw runtime_error("Malformed FASTQ: missing quality line");
-    if (header.empty() || header[0] != '@')
-        throw runtime_error("Malformed FASTQ: header does not start with '@': " + header);
-    if (plus.empty() || plus[0] != '+')
-        throw runtime_error("Malformed FASTQ: third line does not start with '+': " + plus);
-    if (seq.size() != qual.size())
-        throw runtime_error("Malformed FASTQ: sequence and quality lengths differ: " + to_string(seq.size()) + " vs " + to_string(qual.size()));
-    return true;
-}
+struct FileSummary {
+    std::uint64_t read_count = 0;
+    std::unordered_set<std::string> umi_keys;
+};
 
-// Parse ":UMI_<FWD>_<REV>" from header (either with or without the leading '@').
-static string parse_umi(const string& header_line) {
-    size_t start = header_line.find_first_of(":UMI_");
-    if (start == string::npos) {
-        throw runtime_error("Header missing ':UMI_' tag: " + header_line);
+FileSummary LoadUmiKeys(const std::string& fastq_path) {
+    FileSummary summary;
+    summary.umi_keys.reserve(1U << 22);
+
+    std::ifstream input_stream(fastq_path);
+    if (!input_stream.is_open()) {
+        throw std::runtime_error("Failed to open FASTQ: " + fastq_path);
     }
-    // The UMI segment ends at whitespace
-    size_t end = header_line.find_first_of(" \t\r\n", start);
-    if (end == string::npos) end = header_line.size();
-    string umi_part = header_line.substr(start, end - start);
-    return umi_part;
+
+    ont::fastq::Record record;
+    while (ont::fastq::ReadRecord(input_stream, record, fastq_path)) {
+        ++summary.read_count;
+        summary.umi_keys.insert(ont::umi::ParseSingleKey(record.header));
+    }
+
+    return summary;
 }
+
+std::uint64_t CountSetOverlap(
+    const std::unordered_set<std::string>& left_keys,
+    const std::unordered_set<std::string>& right_keys) {
+    const auto* smaller_set = &left_keys;
+    const auto* larger_set = &right_keys;
+    if (left_keys.size() > right_keys.size()) {
+        smaller_set = &right_keys;
+        larger_set = &left_keys;
+    }
+
+    std::uint64_t overlap_count = 0;
+    for (const std::string& key : *smaller_set) {
+        if (larger_set->find(key) != larger_set->end()) {
+            ++overlap_count;
+        }
+    }
+    return overlap_count;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    if (argc != 3) {
+        PrintUsage(argv[0]);
+        return 1;
+    }
 
     try {
-        if (argc < 3) {
-            cerr << "Usage: " << argv[0] << " <fastq1> <fastq2>\n";
-            return 1;
-        }
+        const FileSummary first_summary = LoadUmiKeys(argv[1]);
+        const FileSummary second_summary = LoadUmiKeys(argv[2]);
+        const std::uint64_t overlapping_unique_umis =
+            CountSetOverlap(first_summary.umi_keys, second_summary.umi_keys);
 
-        string fastq1 = argv[1];
-        ifstream in(fastq1);
-
-        unordered_set<string> fastq1_umis;
-        fastq1_umis.reserve(3000000);
-        fastq1_umis.max_load_factor(0.70f);
-
-        string h, s, p, q;
-        while (read_fastq_record(in, h, s, p, q)){
-            string key = parse_umi(h);
-            fastq1_umis.insert(key);
-        }
-
-        string fastq2 = argv[2];
-        ifstream in2(fastq2);
-        uint64_t fastq1_umi_count = fastq1_umis.size();
-        uint64_t fastq2_umi_count = 0;
-        uint64_t overlap_count = 0;
-
-        while (read_fastq_record(in2, h, s, p, q)){
-            string key = parse_umi(h);
-            fastq2_umi_count++;
-            if (fastq1_umis.find(key) != fastq1_umis.end()){
-                overlap_count++;
-            }
-        }
-
-        cout << "FASTQ1_reads=" << fastq1_umi_count
-                << " FASTQ2_reads=" << fastq2_umi_count
-                << " Overlapping_UMIs=" << overlap_count
-                << "\n";
-        return 0;
-    } catch (const exception& e) {
-        cerr << "Error: " << e.what() << "\n";
+        std::cout << "fastq1_reads=" << first_summary.read_count
+                  << " fastq2_reads=" << second_summary.read_count
+                  << " fastq1_unique_umis=" << first_summary.umi_keys.size()
+                  << " fastq2_unique_umis=" << second_summary.umi_keys.size()
+                  << " overlapping_unique_umis=" << overlapping_unique_umis
+                  << "\n";
+    } catch (const std::exception& exception) {
+        std::cerr << "Error: " << exception.what() << "\n";
         return 2;
     }
+
+    return 0;
 }

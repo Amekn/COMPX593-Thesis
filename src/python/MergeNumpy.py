@@ -1,364 +1,486 @@
-"""
-Merge Bonito-style training arrays from multiple folders, **without** loading
-all arrays into RAM at once, with progress bars and ETA.
-
-Strategy (RAM-safe):
-  1) First pass ("Inspecting headers"): open each input .npy with
-     mmap_mode='r' to read only shapes/dtypes and count rows; track max
-     width for references.
-  2) Create output .npy as memory-mapped arrays using
-     numpy.lib.format.open_memmap.
-  3) Second pass ("Streaming rows"): copy in **row blocks** to bound RAM and
-     show smooth progress with ETA. For references.npy, copy only actual width
-     per folder into the left columns; output is zero-initialized for padding.
-
-Each input folder must contain:
-  - chunks.npy
-  - references.npy
-  - reference_lengths.npy
-
-Behavior:
-  - chunks.npy: concatenated along axis=0.
-  - references.npy: right-zero-padded to the maximum width across inputs,
-                    then concatenated along axis=0.
-  - reference_lengths.npy: concatenated along axis=0.
-
-Example:
-    python merge_numpy.py -o merged_dir input1 input2 input3 --overwrite \
-        --target-chunk-mb 64
-"""
+#!/usr/bin/env python3
+"""Merge Bonito training arrays from multiple directories without large RAM spikes."""
 
 from __future__ import annotations
+
 import argparse
-from pathlib import Path
-import sys
-import os
-from typing import List, Tuple
 import math
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
 import numpy as np
 from numpy.lib.format import open_memmap
 
-# Optional tqdm with a safe fallback (no-op with same API used here)
 try:
-    from tqdm import tqdm as _tqdm
+    from tqdm import tqdm as progress_bar
 except Exception:  # pragma: no cover
-    class _TqdmNoOp:
-        def __init__(self, total=None, desc=None, unit=None, **kwargs):
-            self.total = total
-        def update(self, n=1):
+    class _NullProgressBar:
+        """Fallback progress bar used when tqdm is unavailable."""
+
+        def __init__(self, *_args, **_kwargs) -> None:
             pass
-        def set_postfix(self, **kwargs):
+
+        def update(self, _increment: int = 1) -> None:
             pass
-        def close(self):
+
+        def close(self) -> None:
             pass
-    def _tqdm(*args, **kwargs):  # type: ignore
-        return _TqdmNoOp(*args, **kwargs)
 
-REQ_FILES = ("chunks.npy", "references.npy", "reference_lengths.npy")
-
-class MergeError(Exception):
-    pass
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def check_required_files(folder: Path) -> Tuple[Path, Path, Path]:
-    chunks = folder / REQ_FILES[0]
-    refs = folder / REQ_FILES[1]
-    lengths = folder / REQ_FILES[2]
-
-    missing = [str(p.name) for p in (chunks, refs, lengths) if not p.exists()]
-    if missing:
-        raise MergeError(f"Missing files in {folder}: {', '.join(missing)}")
-    return chunks, refs, lengths
+    def progress_bar(*args, **kwargs):  # type: ignore[misc]
+        return _NullProgressBar(*args, **kwargs)
 
 
-def inspect_triplet(folder: Path):
-    """Open arrays in mmap read-only mode and return lightweight metadata.
-
-    Returns:
-        (n_rows, chunks_tail_shape, refs_width, dtypes_tuple)
-    where dtypes_tuple is (chunks_dtype, refs_dtype, reflens_dtype).
-    """
-    chunks_p, refs_p, lengths_p = check_required_files(folder)
-
-    chunks = np.load(chunks_p, allow_pickle=False, mmap_mode='r')
-    refs = np.load(refs_p, allow_pickle=False, mmap_mode='r')
-    reflens = np.load(lengths_p, allow_pickle=False, mmap_mode='r')
-
-    if chunks.ndim < 1:
-        raise MergeError(f"chunks.npy must be at least 1-D; got {chunks.shape}")
-    if refs.ndim != 2:
-        raise MergeError(f"references.npy must be 2-D; got {refs.shape}")
-    if reflens.ndim != 1:
-        raise MergeError(f"reference_lengths.npy must be 1-D; got {reflens.shape}")
-
-    n_chunks = chunks.shape[0]
-    n_refs = refs.shape[0]
-    n_lens = reflens.shape[0]
-    if not (n_chunks == n_refs == n_lens):
-        raise MergeError(
-            f"Row count mismatch in {folder} (chunks: {n_chunks}, references: {n_refs}, reference_lengths: {n_lens})"
-        )
-
-    chunks_tail_shape = chunks.shape[1:]  # may be (T,) or (T, F, ...)
-    refs_width = refs.shape[1]
-    dtypes = (chunks.dtype, refs.dtype, reflens.dtype)
-
-    return n_chunks, chunks_tail_shape, refs_width, dtypes
+REQUIRED_FILENAMES = ("chunks.npy", "references.npy", "reference_lengths.npy")
 
 
-def common_dtype(dtypes: List[np.dtype]) -> np.dtype:
-    """Compute a safe common dtype via np.result_type."""
-    dt = dtypes[0]
-    for d in dtypes[1:]:
-        dt = np.result_type(dt, d)
-    return np.dtype(dt)
+class MergeError(RuntimeError):
+    """Raised when the input datasets cannot be merged safely."""
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
+@dataclass(frozen=True)
+class ArrayTripletPaths:
+    """Locations of the three required training arrays inside one dataset directory."""
+
+    chunks: Path
+    references: Path
+    reference_lengths: Path
+
+
+@dataclass(frozen=True)
+class DatasetMetadata:
+    """Lightweight header information gathered from one input dataset."""
+
+    directory: Path
+    row_count: int
+    chunk_tail_shape: tuple[int, ...]
+    reference_width: int
+    chunks_dtype: np.dtype
+    references_dtype: np.dtype
+    reference_lengths_dtype: np.dtype
+
+
+@dataclass(frozen=True)
+class OutputPaths:
+    """Destination filenames for the merged training arrays."""
+
+    chunks: Path
+    references: Path
+    reference_lengths: Path
+
+
+@dataclass(frozen=True)
+class MergePlan:
+    """Derived merge layout shared across the streaming copy and shuffle stages."""
+
+    datasets: list[DatasetMetadata]
+    total_rows: int
+    chunk_shape: tuple[int, ...]
+    reference_shape: tuple[int, int]
+    reference_length_shape: tuple[int]
+    chunks_dtype: np.dtype
+    references_dtype: np.dtype
+    reference_lengths_dtype: np.dtype
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Create the command-line interface for the array merger."""
     parser = argparse.ArgumentParser(
         description=(
-            "Merge Bonito training arrays (chunks/references/reference_lengths) "
-            "from multiple folders without high RAM usage, with progress bars."
+            "Merge Bonito training arrays (chunks, references, reference_lengths) "
+            "from multiple directories without loading every array into RAM."
         )
     )
     parser.add_argument(
         "input_dirs",
         nargs="+",
-        help="Input folders (order is preserved). Each must contain the three .npy files.",
+        help="Input directories. Each must contain chunks.npy, references.npy, and reference_lengths.npy.",
     )
-    parser.add_argument(
-        "-o",
-        "--output",
-        required=True,
-        help="Output folder to write merged arrays into.",
-    )
+    parser.add_argument("-o", "--output", required=True, help="Output directory.")
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Allow overwriting existing output files.",
+        help="Allow replacement of existing output array files.",
     )
     parser.add_argument(
         "--target-chunk-mb",
         type=float,
         default=64.0,
-        help=(
-            "Approximate memory budget per streaming block (in MiB). "
-            "Larger values can be faster but use more RAM."
-        ),
+        help="Approximate RAM budget, in MiB, for each streaming block.",
     )
     parser.add_argument(
         "--shuffle",
         action="store_true",
-        help="Shuffle rows randomly after merge, keeping correspondence among arrays.",
+        help="Shuffle rows after merging while preserving row correspondence.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Random seed for shuffling (default: system entropy).",
+        help="Random seed used when --shuffle is enabled.",
     )
-    return parser.parse_args()
+    return parser
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────────
 
-def main() -> int:
-    args = parse_args()
+def resolve_required_paths(dataset_directory: Path) -> ArrayTripletPaths:
+    """Locate the three required NumPy files in one input directory."""
+    paths = ArrayTripletPaths(
+        chunks=dataset_directory / REQUIRED_FILENAMES[0],
+        references=dataset_directory / REQUIRED_FILENAMES[1],
+        reference_lengths=dataset_directory / REQUIRED_FILENAMES[2],
+    )
 
-    input_paths = [Path(p).resolve() for p in args.input_dirs]
-    out_dir = Path(args.output).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    missing_files = [
+        path.name
+        for path in (paths.chunks, paths.references, paths.reference_lengths)
+        if not path.exists()
+    ]
+    if missing_files:
+        missing_file_list = ", ".join(missing_files)
+        raise MergeError(f"Missing required files in {dataset_directory}: {missing_file_list}")
 
-    print(f"[INFO] Loading headers from {len(input_paths)} input folder(s) (mmap, no bulk RAM).")
+    return paths
 
-    # First pass: collect metadata only
-    total_rows = 0
-    chunk_tail_shapes = set()
-    refs_widths: List[int] = []
 
-    chunk_dtypes: List[np.dtype] = []
-    refs_dtypes: List[np.dtype] = []
-    reflens_dtypes: List[np.dtype] = []
+def inspect_dataset(dataset_directory: Path) -> DatasetMetadata:
+    """Read array headers with memmap mode and return merge-relevant metadata."""
+    triplet_paths = resolve_required_paths(dataset_directory)
+    chunk_array = np.load(triplet_paths.chunks, allow_pickle=False, mmap_mode="r")
+    reference_array = np.load(triplet_paths.references, allow_pickle=False, mmap_mode="r")
+    reference_length_array = np.load(
+        triplet_paths.reference_lengths, allow_pickle=False, mmap_mode="r"
+    )
 
-    per_folder_rows: List[int] = []
-    per_folder_refs_width: List[int] = []
+    if chunk_array.ndim < 1:
+        raise MergeError(f"chunks.npy must be at least 1-D, got shape {chunk_array.shape}")
+    if reference_array.ndim != 2:
+        raise MergeError(f"references.npy must be 2-D, got shape {reference_array.shape}")
+    if reference_length_array.ndim != 1:
+        raise MergeError(
+            "reference_lengths.npy must be 1-D, "
+            f"got shape {reference_length_array.shape}"
+        )
 
-    bar1 = _tqdm(total=len(input_paths), desc="Inspecting headers", unit="dir")
-    for folder in input_paths:
-        if not folder.is_dir():
-            raise MergeError(f"Not a directory: {folder}")
-        n_rows, chunks_tail_shape, refs_width, dtypes = inspect_triplet(folder)
+    row_count = int(chunk_array.shape[0])
+    if row_count != int(reference_array.shape[0]) or row_count != int(reference_length_array.shape[0]):
+        raise MergeError(
+            "Row-count mismatch in "
+            f"{dataset_directory} (chunks={chunk_array.shape[0]}, "
+            f"references={reference_array.shape[0]}, "
+            f"reference_lengths={reference_length_array.shape[0]})"
+        )
 
-        total_rows += n_rows
-        chunk_tail_shapes.add(chunks_tail_shape)
-        refs_widths.append(refs_width)
+    return DatasetMetadata(
+        directory=dataset_directory,
+        row_count=row_count,
+        chunk_tail_shape=tuple(int(dimension) for dimension in chunk_array.shape[1:]),
+        reference_width=int(reference_array.shape[1]),
+        chunks_dtype=np.dtype(chunk_array.dtype),
+        references_dtype=np.dtype(reference_array.dtype),
+        reference_lengths_dtype=np.dtype(reference_length_array.dtype),
+    )
 
-        chunk_dtypes.append(dtypes[0])
-        refs_dtypes.append(dtypes[1])
-        reflens_dtypes.append(dtypes[2])
 
-        per_folder_rows.append(n_rows)
-        per_folder_refs_width.append(refs_width)
-        bar1.update(1)
-    bar1.close()
+def compute_common_dtype(dtypes: Sequence[np.dtype]) -> np.dtype:
+    """Return a common dtype that can safely represent all supplied arrays."""
+    common = dtypes[0]
+    for dtype in dtypes[1:]:
+        common = np.result_type(common, dtype)
+    return np.dtype(common)
 
+
+def build_merge_plan(input_directories: Sequence[Path]) -> MergePlan:
+    """Inspect all inputs and derive the merged output shape and dtypes."""
+    dataset_metadata: list[DatasetMetadata] = []
+    progress = progress_bar(total=len(input_directories), desc="Inspecting headers", unit="dir")
+
+    try:
+        for dataset_directory in input_directories:
+            if not dataset_directory.is_dir():
+                raise MergeError(f"Input path is not a directory: {dataset_directory}")
+            dataset_metadata.append(inspect_dataset(dataset_directory))
+            progress.update(1)
+    finally:
+        progress.close()
+
+    if not dataset_metadata:
+        raise MergeError("At least one input directory is required.")
+
+    chunk_tail_shapes = {metadata.chunk_tail_shape for metadata in dataset_metadata}
     if len(chunk_tail_shapes) != 1:
-        detail = ", ".join(sorted(map(str, chunk_tail_shapes)))
-        raise MergeError(f"Inconsistent chunks tail shapes across inputs: {detail}")
+        shape_list = ", ".join(str(shape) for shape in sorted(chunk_tail_shapes))
+        raise MergeError(f"Inconsistent chunk tail shapes across inputs: {shape_list}")
 
-    max_ref_w = max(refs_widths) if refs_widths else 0
+    total_rows = sum(metadata.row_count for metadata in dataset_metadata)
+    max_reference_width = max(metadata.reference_width for metadata in dataset_metadata)
+    chunk_tail_shape = next(iter(chunk_tail_shapes))
 
-    chunks_tail_shape = next(iter(chunk_tail_shapes))
-    chunks_common_dtype = common_dtype(chunk_dtypes)
-    refs_common_dtype = common_dtype(refs_dtypes)
-    reflens_common_dtype = common_dtype(reflens_dtypes)
+    chunks_dtype = compute_common_dtype([metadata.chunks_dtype for metadata in dataset_metadata])
+    references_dtype = compute_common_dtype(
+        [metadata.references_dtype for metadata in dataset_metadata]
+    )
+    reference_lengths_dtype = compute_common_dtype(
+        [metadata.reference_lengths_dtype for metadata in dataset_metadata]
+    )
 
-    # Prepare output paths
-    out_chunks = out_dir / "chunks.npy"
-    out_refs = out_dir / "references.npy"
-    out_reflens = out_dir / "reference_lengths.npy"
+    return MergePlan(
+        datasets=dataset_metadata,
+        total_rows=total_rows,
+        chunk_shape=(total_rows, *chunk_tail_shape),
+        reference_shape=(total_rows, max_reference_width),
+        reference_length_shape=(total_rows,),
+        chunks_dtype=chunks_dtype,
+        references_dtype=references_dtype,
+        reference_lengths_dtype=reference_lengths_dtype,
+    )
 
-    # Overwrite checks
-    for p in (out_chunks, out_refs, out_reflens):
-        if p.exists() and not args.overwrite:
-            raise MergeError(f"Output file exists: {p}. Use --overwrite to replace.")
 
-    # Create memmapped outputs
+def resolve_output_paths(output_directory: Path) -> OutputPaths:
+    """Construct the destination array paths in the output directory."""
+    return OutputPaths(
+        chunks=output_directory / REQUIRED_FILENAMES[0],
+        references=output_directory / REQUIRED_FILENAMES[1],
+        reference_lengths=output_directory / REQUIRED_FILENAMES[2],
+    )
+
+
+def ensure_output_paths_are_writable(output_paths: OutputPaths, overwrite: bool) -> None:
+    """Prevent accidental replacement of an existing merged dataset unless requested."""
+    for output_path in (output_paths.chunks, output_paths.references, output_paths.reference_lengths):
+        if output_path.exists() and not overwrite:
+            raise MergeError(
+                f"Output file already exists: {output_path}. Use --overwrite to replace it."
+            )
+
+
+def create_output_memmaps(plan: MergePlan, output_paths: OutputPaths) -> tuple[np.memmap, np.memmap, np.memmap]:
+    """Allocate the merged arrays as writable memmaps on disk."""
     print("[INFO] Creating output memmaps ...")
-    chunks_shape = (total_rows,) + chunks_tail_shape
-    refs_shape = (total_rows, max_ref_w)
-    reflens_shape = (total_rows,)
-
-    out_chunks_mm = open_memmap(
-        out_chunks, mode='w+', dtype=chunks_common_dtype, shape=chunks_shape
+    merged_chunks = open_memmap(
+        output_paths.chunks,
+        mode="w+",
+        dtype=plan.chunks_dtype,
+        shape=plan.chunk_shape,
     )
-    out_refs_mm = open_memmap(
-        out_refs, mode='w+', dtype=refs_common_dtype, shape=refs_shape
+    merged_references = open_memmap(
+        output_paths.references,
+        mode="w+",
+        dtype=plan.references_dtype,
+        shape=plan.reference_shape,
     )
-    out_reflens_mm = open_memmap(
-        out_reflens, mode='w+', dtype=reflens_common_dtype, shape=reflens_shape
+    merged_reference_lengths = open_memmap(
+        output_paths.reference_lengths,
+        mode="w+",
+        dtype=plan.reference_lengths_dtype,
+        shape=plan.reference_length_shape,
     )
 
-    # Initialize references with zeros for padding
-    out_refs_mm[:] = 0
+    # Reference rows are zero-padded out to the global maximum width.
+    merged_references[:] = 0
+    return merged_chunks, merged_references, merged_reference_lengths
 
-    # Second pass: stream-copy into slices with progress/ETA
-    print("[INFO] Streaming arrays into output (mmap → mmap) ...")
 
-    # Compute per-row byte size to choose a block size near target MiB
-    # chunks bytes per row
-    chunks_row_elems = int(math.prod(chunks_tail_shape)) if len(chunks_tail_shape) else 1
-    chunks_row_bytes = chunks_row_elems * int(np.dtype(chunks_common_dtype).itemsize)
-    # refs bytes per row depends on *actual* width per folder; we compute per folder
-    refs_itemsize = int(np.dtype(refs_common_dtype).itemsize)
-    # reflens is 1 per row
-    reflens_row_bytes = int(np.dtype(reflens_common_dtype).itemsize)
+def estimate_rows_per_block(
+    metadata: DatasetMetadata,
+    plan: MergePlan,
+    target_bytes: int,
+) -> int:
+    """Choose a row block size that fits approximately within the target memory budget."""
+    chunk_elements_per_row = int(math.prod(metadata.chunk_tail_shape)) if metadata.chunk_tail_shape else 1
+    chunk_bytes_per_row = chunk_elements_per_row * int(np.dtype(plan.chunks_dtype).itemsize)
+    reference_bytes_per_row = metadata.reference_width * int(np.dtype(plan.references_dtype).itemsize)
+    reference_length_bytes_per_row = int(np.dtype(plan.reference_lengths_dtype).itemsize)
 
-    target_bytes = max(1, int(args.target_chunk_mb * 1024 * 1024))
+    bytes_per_row = chunk_bytes_per_row + reference_bytes_per_row + reference_length_bytes_per_row
+    return max(1, min(metadata.row_count, target_bytes // max(1, bytes_per_row)))
 
-    bar2 = _tqdm(total=total_rows, desc="Streaming rows", unit="row")
-    write_pos = 0
-    for folder_idx, folder in enumerate(input_paths):
-        n_rows = per_folder_rows[folder_idx]
-        ref_w = per_folder_refs_width[folder_idx]
-        r_end = write_pos + n_rows
 
-        # Estimate bytes per row for this folder
-        per_row_bytes = chunks_row_bytes + ref_w * refs_itemsize + reflens_row_bytes
-        block_rows = max(1, min(n_rows, target_bytes // max(1, per_row_bytes)))
+def stream_merge(
+    plan: MergePlan,
+    merged_chunks: np.memmap,
+    merged_references: np.memmap,
+    merged_reference_lengths: np.memmap,
+    target_chunk_mb: float,
+) -> None:
+    """Copy all input rows into the output memmaps in bounded blocks."""
+    print("[INFO] Streaming arrays into output (mmap -> mmap) ...")
+    target_bytes = max(1, int(target_chunk_mb * 1024 * 1024))
+    progress = progress_bar(total=plan.total_rows, desc="Streaming rows", unit="row")
 
-        # Load inputs as memmaps
-        chunks_p, refs_p, lengths_p = check_required_files(folder)
-        chunks = np.load(chunks_p, allow_pickle=False, mmap_mode='r')
-        refs = np.load(refs_p, allow_pickle=False, mmap_mode='r')
-        reflens = np.load(lengths_p, allow_pickle=False, mmap_mode='r')
+    destination_row_start = 0
+    try:
+        for metadata in plan.datasets:
+            triplet_paths = resolve_required_paths(metadata.directory)
+            source_chunks = np.load(triplet_paths.chunks, allow_pickle=False, mmap_mode="r")
+            source_references = np.load(triplet_paths.references, allow_pickle=False, mmap_mode="r")
+            source_reference_lengths = np.load(
+                triplet_paths.reference_lengths, allow_pickle=False, mmap_mode="r"
+            )
 
-        # Block-wise copy with progress updates
-        start = 0
-        while start < n_rows:
-            end = min(n_rows, start + block_rows)
-            rs, re = write_pos + start, write_pos + end
+            rows_per_block = estimate_rows_per_block(metadata, plan, target_bytes)
+            source_row_start = 0
+            while source_row_start < metadata.row_count:
+                source_row_end = min(metadata.row_count, source_row_start + rows_per_block)
+                destination_row_end = destination_row_start + (source_row_end - source_row_start)
 
-            # chunks
-            out_chunks_mm[rs:re, ...] = chunks[start:end, ...]
-            # references (only copy actual width)
-            if ref_w > 0:
-                out_refs_mm[rs:re, :ref_w] = refs[start:end, :ref_w]
-            # reference lengths
-            out_reflens_mm[rs:re] = reflens[start:end]
+                merged_chunks[destination_row_start:destination_row_end, ...] = source_chunks[
+                    source_row_start:source_row_end, ...
+                ]
+                merged_references[
+                    destination_row_start:destination_row_end, : metadata.reference_width
+                ] = source_references[source_row_start:source_row_end, : metadata.reference_width]
+                merged_reference_lengths[destination_row_start:destination_row_end] = (
+                    source_reference_lengths[source_row_start:source_row_end]
+                )
 
-            bar2.update(end - start)
-            start = end
+                progress.update(source_row_end - source_row_start)
+                destination_row_start = destination_row_end
+                source_row_start = source_row_end
+    finally:
+        progress.close()
 
-        write_pos = r_end
-    bar2.close()
+    merged_chunks.flush()
+    merged_references.flush()
+    merged_reference_lengths.flush()
 
-    # Ensure data is flushed to disk
-    out_chunks_mm.flush()
-    out_refs_mm.flush()
-    out_reflens_mm.flush()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Optional shuffling to randomize row order while preserving alignment
-    # ─────────────────────────────────────────────────────────────────────────
-    if args.shuffle:
-        print("[INFO] Shuffling merged rows ...")
-        rng = np.random.default_rng(args.seed)
-        perm = rng.permutation(total_rows)
+def shuffle_output_rows(
+    plan: MergePlan,
+    output_paths: OutputPaths,
+    target_chunk_mb: float,
+    seed: int | None,
+) -> None:
+    """Shuffle the merged arrays on disk while keeping row alignment intact."""
+    print("[INFO] Shuffling merged rows ...")
+    merged_chunks = np.load(output_paths.chunks, allow_pickle=False, mmap_mode="r")
+    merged_references = np.load(output_paths.references, allow_pickle=False, mmap_mode="r")
+    merged_reference_lengths = np.load(output_paths.reference_lengths, allow_pickle=False, mmap_mode="r")
 
-        # Estimate per‑row size using the maximum reference width
-        per_row_bytes_max = chunks_row_bytes + max_ref_w * refs_itemsize + reflens_row_bytes
-        shuffle_block_rows = max(1, int(target_bytes // max(1, per_row_bytes_max)))
+    rng = np.random.default_rng(seed)
+    permutation = rng.permutation(plan.total_rows)
 
-        # Temporary files for shuffled output
-        tmp_chunks = out_dir / "chunks.tmp.npy"
-        tmp_refs = out_dir / "references.tmp.npy"
-        tmp_reflens = out_dir / "reference_lengths.tmp.npy"
+    temporary_paths = OutputPaths(
+        chunks=output_paths.chunks.with_name("chunks.tmp.npy"),
+        references=output_paths.references.with_name("references.tmp.npy"),
+        reference_lengths=output_paths.reference_lengths.with_name("reference_lengths.tmp.npy"),
+    )
 
-        tmp_chunks_mm = open_memmap(tmp_chunks, mode='w+', dtype=chunks_common_dtype, shape=chunks_shape)
-        tmp_refs_mm = open_memmap(tmp_refs, mode='w+', dtype=refs_common_dtype, shape=refs_shape)
-        tmp_reflens_mm = open_memmap(tmp_reflens, mode='w+', dtype=reflens_common_dtype, shape=reflens_shape)
+    shuffled_chunks = open_memmap(
+        temporary_paths.chunks,
+        mode="w+",
+        dtype=plan.chunks_dtype,
+        shape=plan.chunk_shape,
+    )
+    shuffled_references = open_memmap(
+        temporary_paths.references,
+        mode="w+",
+        dtype=plan.references_dtype,
+        shape=plan.reference_shape,
+    )
+    shuffled_reference_lengths = open_memmap(
+        temporary_paths.reference_lengths,
+        mode="w+",
+        dtype=plan.reference_lengths_dtype,
+        shape=plan.reference_length_shape,
+    )
 
-        bar3 = _tqdm(total=total_rows, desc="Shuffling", unit="row")
-        for start in range(0, total_rows, shuffle_block_rows):
-            end = min(total_rows, start + shuffle_block_rows)
-            idx = perm[start:end]
-            tmp_chunks_mm[start:end, ...] = out_chunks_mm[idx, ...]
-            tmp_refs_mm[start:end, ...] = out_refs_mm[idx, ...]
-            tmp_reflens_mm[start:end] = out_reflens_mm[idx]
-            bar3.update(end - start)
-        bar3.close()
+    chunk_elements_per_row = int(math.prod(plan.chunk_shape[1:])) if len(plan.chunk_shape) > 1 else 1
+    chunk_bytes_per_row = chunk_elements_per_row * int(np.dtype(plan.chunks_dtype).itemsize)
+    reference_bytes_per_row = plan.reference_shape[1] * int(np.dtype(plan.references_dtype).itemsize)
+    reference_length_bytes_per_row = int(np.dtype(plan.reference_lengths_dtype).itemsize)
+    bytes_per_row = chunk_bytes_per_row + reference_bytes_per_row + reference_length_bytes_per_row
+    rows_per_block = max(1, int(max(1, target_chunk_mb * 1024 * 1024) // max(1, bytes_per_row)))
 
-        tmp_chunks_mm.flush()
-        tmp_refs_mm.flush()
-        tmp_reflens_mm.flush()
+    progress = progress_bar(total=plan.total_rows, desc="Shuffling", unit="row")
+    try:
+        for shuffled_row_start in range(0, plan.total_rows, rows_per_block):
+            shuffled_row_end = min(plan.total_rows, shuffled_row_start + rows_per_block)
+            row_indices = permutation[shuffled_row_start:shuffled_row_end]
 
-        # Atomically replace originals with shuffled versions
-        os.replace(tmp_chunks, out_chunks)
-        os.replace(tmp_refs, out_refs)
-        os.replace(tmp_reflens, out_reflens)
+            shuffled_chunks[shuffled_row_start:shuffled_row_end, ...] = merged_chunks[row_indices, ...]
+            shuffled_references[shuffled_row_start:shuffled_row_end, ...] = (
+                merged_references[row_indices, ...]
+            )
+            shuffled_reference_lengths[shuffled_row_start:shuffled_row_end] = (
+                merged_reference_lengths[row_indices]
+            )
+            progress.update(shuffled_row_end - shuffled_row_start)
+    finally:
+        progress.close()
 
-    # Final report
-    print(f"[DONE] Wrote merged arrays to {out_dir}:")
-    if args.shuffle:
-        print("       (rows were shuffled)")
-    print(f"       {out_chunks.name}:   shape {chunks_shape}, dtype {out_chunks_mm.dtype}")
-    print(f"       {out_refs.name}:     shape {refs_shape}, dtype {out_refs_mm.dtype} (max width {max_ref_w})")
-    print(f"       {out_reflens.name}:  shape {reflens_shape}, dtype {out_reflens_mm.dtype}")
-    print(f"[DONE] Total records: {total_rows}")
+    shuffled_chunks.flush()
+    shuffled_references.flush()
+    shuffled_reference_lengths.flush()
+
+    os.replace(temporary_paths.chunks, output_paths.chunks)
+    os.replace(temporary_paths.references, output_paths.references)
+    os.replace(temporary_paths.reference_lengths, output_paths.reference_lengths)
+
+
+def print_summary(plan: MergePlan, output_paths: OutputPaths, shuffled: bool) -> None:
+    """Print a concise summary of the merged dataset written to disk."""
+    print(f"[DONE] Wrote merged arrays to {output_paths.chunks.parent}:")
+    if shuffled:
+        print("       rows shuffled: yes")
+    print(
+        f"       {output_paths.chunks.name}: shape {plan.chunk_shape}, "
+        f"dtype {plan.chunks_dtype}"
+    )
+    print(
+        f"       {output_paths.references.name}: shape {plan.reference_shape}, "
+        f"dtype {plan.references_dtype}"
+    )
+    print(
+        f"       {output_paths.reference_lengths.name}: shape {plan.reference_length_shape}, "
+        f"dtype {plan.reference_lengths_dtype}"
+    )
+    print(f"[DONE] Total records: {plan.total_rows}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command-line entry point."""
+    arguments = build_argument_parser().parse_args(argv)
+    input_directories = [Path(directory).resolve() for directory in arguments.input_dirs]
+    output_directory = Path(arguments.output).resolve()
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"[INFO] Inspecting {len(input_directories)} input director"
+        f"{'y' if len(input_directories) == 1 else 'ies'} ..."
+    )
+    plan = build_merge_plan(input_directories)
+    output_paths = resolve_output_paths(output_directory)
+    ensure_output_paths_are_writable(output_paths, overwrite=arguments.overwrite)
+
+    merged_chunks, merged_references, merged_reference_lengths = create_output_memmaps(
+        plan=plan,
+        output_paths=output_paths,
+    )
+    stream_merge(
+        plan=plan,
+        merged_chunks=merged_chunks,
+        merged_references=merged_references,
+        merged_reference_lengths=merged_reference_lengths,
+        target_chunk_mb=arguments.target_chunk_mb,
+    )
+
+    if arguments.shuffle:
+        shuffle_output_rows(
+            plan=plan,
+            output_paths=output_paths,
+            target_chunk_mb=arguments.target_chunk_mb,
+            seed=arguments.seed,
+        )
+
+    print_summary(plan, output_paths, shuffled=arguments.shuffle)
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except MergeError as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
+    except MergeError as exception:
+        print(f"[ERROR] {exception}", file=sys.stderr)
         raise SystemExit(2)

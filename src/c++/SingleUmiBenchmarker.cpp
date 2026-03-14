@@ -294,7 +294,7 @@ static AlignmentCounts banded_global_align(
     int i = m, j = n;
     while (i > 0 || j > 0) {
         if (!(j >= startJ[i] && j <= endJ[i])) {
-            throw runtime_error("Backtrace stepped خارج band. This should not happen.");
+            throw runtime_error("Backtrace stepped outside the alignment band. This should not happen.");
         }
         uint8_t d = dir[i][j - startJ[i]];
         if (d == 0) { // diag

@@ -1,422 +1,233 @@
+#include <cstdint>
 #include <iostream>
-#include <fstream>
 #include <string>
 #include <vector>
-#include <algorithm>
-#include <stdexcept>
-#include <cctype>
-#include <cstdint>
 
-using namespace std;
+#include "ont_tools/Fastq.hpp"
+#include "ont_tools/Sequence.hpp"
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Utility helpers
-// ──────────────────────────────────────────────────────────────────────────────
-static uint8_t IUPAC_bits[256];
-static char IUPAC_comp[256];
+namespace {
 
-static inline char up(char c)
-{
-    return static_cast<char>(toupper(static_cast<unsigned char>(c)));
-}
-
-
-static inline uint8_t base_bit(char b)
-{
-    switch (b)
-    {
-    case 'A':
-        return 1;
-    case 'C':
-        return 2;
-    case 'G':
-        return 4;
-    case 'T':
-        return 8;
-    default:
-        return 0; // non-ACGT in read -> mismatch unless primer allows none
-    }
-}
-
-static string to_rc(const string &s)
-{
-    const size_t n = s.size();
-    string out;
-    out.resize(n);
-    for (size_t i = 0; i < n; ++i)
-    {
-        // read from end to start
-        char c = up(s[n - 1 - i]);
-        // complement
-        char cc = IUPAC_comp[static_cast<unsigned char>(c)];
-        // write from start to end
-        out[i] = cc;
-    }
-    return out;
-}
-
-static string reverse_quality(const string &qual)
-{
-    const size_t n = qual.size();
-    string out;
-    out.resize(n);
-    for (size_t i = 0; i < n; ++i)
-    {
-        out[i] = qual[n - 1 - i];
-    }
-    return out;
-}
-// ──────────────────────────────────────────────────────────────────────────────
-// FASTQ I/O
-// ──────────────────────────────────────────────────────────────────────────────
-struct FastqRecord
-{
-    string id;
-    string seq;
-    string plus;
-    string qual;
+struct PrimerLayout {
+    std::string forward_primer;
+    std::string reverse_primer;
+    std::string forward_primer_reverse_complement;
+    std::string reverse_primer_reverse_complement;
+    std::vector<int> forward_umi_positions;
+    std::vector<int> reverse_umi_positions;
+    std::vector<int> forward_reverse_complement_umi_positions;
+    std::vector<int> reverse_reverse_complement_umi_positions;
 };
 
-class FastqReader
-{
-public:
-    explicit FastqReader(const string &path) : in_(path)
-    {
-        if (!in_.is_open())
-            throw std::runtime_error("Failed to open input: " + path);
-    }
-    bool next(FastqRecord &rec)
-    {
-        string l1, l2, l3, l4;
-        if (!std::getline(in_, l1))
-            return false;
-        if (!std::getline(in_, l2))
-            return false;
-        if (!std::getline(in_, l3))
-            return false;
-        if (!std::getline(in_, l4))
-            return false;
-        if (l1.empty() || l1[0] != '@')
-            return false;
-        rec.id = l1;
-        rec.seq = l2;
-        rec.plus = l3;
-        rec.qual = l4;
-        return true;
-    }
-
-private:
-    std::ifstream in_;
-};
-
-class FastqWriter
-{
-public:
-    explicit FastqWriter(const string &path) : out_(path)
-    {
-        if (!out_.is_open())
-            throw std::runtime_error("Failed to open output: " + path);
-    }
-    void write(const FastqRecord &rec)
-    {
-        out_ << rec.id << '\n'
-             << rec.seq << '\n'
-             << rec.plus << '\n'
-             << rec.qual << '\n';
-    }
-
-private:
-    std::ofstream out_;
-};
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Processors
-// ──────────────────────────────────────────────────────────────────────────────
-// Initiate IUPAC bitmasks and complements
-static void init_iupac()
-{
-    auto set_code = [](char c, const char *allowed)
-    {
-        uint8_t bits = 0;
-        for (const char *p = allowed; *p; ++p)
-            bits |= base_bit(*p);
-        IUPAC_bits[static_cast<unsigned char>(c)] = bits;
-    };
-
-    // Zero-init then set
-    for (int i = 0; i < 256; ++i)
-    {
-        IUPAC_bits[i] = 0;
-        IUPAC_comp[i] = '?';
-    }
-
-    set_code('A', "A");
-    set_code('C', "C");
-    set_code('G', "G");
-    set_code('T', "T");
-    set_code('R', "AG");
-    set_code('Y', "CT");
-    set_code('S', "GC");
-    set_code('W', "AT");
-    set_code('K', "GT");
-    set_code('M', "AC");
-    set_code('B', "CGT");
-    set_code('D', "AGT");
-    set_code('H', "ACT");
-    set_code('V', "ACG");
-    set_code('N', "ACGT");
-
-    IUPAC_comp[(unsigned char)'A'] = 'T';
-    IUPAC_comp[(unsigned char)'C'] = 'G';
-    IUPAC_comp[(unsigned char)'G'] = 'C';
-    IUPAC_comp[(unsigned char)'T'] = 'A';
-    IUPAC_comp[(unsigned char)'R'] = 'Y';
-    IUPAC_comp[(unsigned char)'Y'] = 'R';
-    IUPAC_comp[(unsigned char)'S'] = 'S';
-    IUPAC_comp[(unsigned char)'W'] = 'W';
-    IUPAC_comp[(unsigned char)'K'] = 'M';
-    IUPAC_comp[(unsigned char)'M'] = 'K';
-    IUPAC_comp[(unsigned char)'B'] = 'V';
-    IUPAC_comp[(unsigned char)'D'] = 'H';
-    IUPAC_comp[(unsigned char)'H'] = 'D';
-    IUPAC_comp[(unsigned char)'V'] = 'B';
-    IUPAC_comp[(unsigned char)'N'] = 'N';
+void PrintUsage(const char* program_name) {
+    std::cerr
+        << "Usage: " << program_name
+        << " <input.fastq> <output.fastq> <forward_primer> <reverse_primer> <max_mismatch>\n\n"
+        << "Extract dual UMIs from ambiguous primer positions, append them to the FASTQ header,\n"
+        << "and trim the read to the insert region bounded by the primer pair.\n";
 }
 
-
-
-// Any non-ACGT in primer marks a UMI position
-static vector<int> umi_mask(const string &primer)
-{
-    vector<int> pos;
-    for (int i = 0; i < (int)primer.size(); ++i)
-    {
-        char c = up(primer[i]);
-        if (c != 'A' && c != 'C' && c != 'G' && c != 'T')
-            pos.push_back(i);
+bool TryFindPrimerSpan(
+    const std::string& uppercase_sequence,
+    const std::string& left_primer,
+    const std::string& right_primer,
+    const int max_mismatches,
+    std::size_t* left_start,
+    std::size_t* right_start) {
+    const int left_index = ont::seq::FindPrimerFromLeft(uppercase_sequence, left_primer, max_mismatches);
+    const int right_index = ont::seq::FindPrimerFromRight(uppercase_sequence, right_primer, max_mismatches);
+    if (left_index < 0 || right_index < 0) {
+        return false;
     }
-    return pos;
-}
 
-// IUPAC-aware match with <= max_mismatch
-static inline bool iupac_match_leq_mismatches(const string &read_seq, int start,
-                                              const string &primer, int max_mismatch)
-{
-    int mm = 0;
-    const int L = (int)primer.size();
-    for (int i = 0; i < L; ++i)
-    {
-        char r = up(read_seq[start + i]);
-        char p = up(primer[i]);
-        uint8_t allowed = IUPAC_bits[static_cast<unsigned char>(p)];
-        uint8_t rb = base_bit(r);
-        if ((rb & allowed) == 0)
-        {
-            if (++mm > max_mismatch)
-                return false;
-        }
+    const std::size_t left_start_index = static_cast<std::size_t>(left_index);
+    const std::size_t right_start_index = static_cast<std::size_t>(right_index);
+    if (left_start_index + left_primer.size() > right_start_index) {
+        return false;
     }
+
+    *left_start = left_start_index;
+    *right_start = right_start_index;
     return true;
 }
 
-// Slide left->right: first match index, else -1
-static int find_from_start(const string &read_seq, const string &primer, int max_mismatch)
-{
-    int L = (int)primer.size();
-    int R = (int)read_seq.size();
-    if (L > R)
-        return -1;
-    for (int i = 0; i <= R - L; ++i)
-    {
-        if (iupac_match_leq_mismatches(read_seq, i, primer, max_mismatch))
-            return i;
+bool ExtractForwardRead(
+    ont::fastq::Record* record,
+    const std::string& uppercase_sequence,
+    const PrimerLayout& layout,
+    const int max_mismatches) {
+    std::size_t left_start = 0;
+    std::size_t right_start = 0;
+    if (!TryFindPrimerSpan(
+            uppercase_sequence,
+            layout.forward_primer,
+            layout.reverse_primer_reverse_complement,
+            max_mismatches,
+            &left_start,
+            &right_start)) {
+        return false;
     }
-    return -1;
+
+    const std::string left_primer_region =
+        uppercase_sequence.substr(left_start, layout.forward_primer.size());
+    const std::string right_primer_region =
+        uppercase_sequence.substr(right_start, layout.reverse_primer_reverse_complement.size());
+
+    const std::string forward_umi =
+        ont::seq::ExtractIndexedBases(left_primer_region, layout.forward_umi_positions);
+    const std::string reverse_umi = ont::seq::ExtractIndexedBases(
+        right_primer_region, layout.reverse_reverse_complement_umi_positions);
+
+    const std::size_t trimmed_start =
+        left_start + static_cast<std::size_t>(layout.forward_umi_positions.back()) + 1U;
+    const std::size_t trimmed_end =
+        right_start + static_cast<std::size_t>(layout.reverse_reverse_complement_umi_positions.front());
+    if (trimmed_end < trimmed_start) {
+        return false;
+    }
+
+    record->header += ":UMI_" + forward_umi + "_" + reverse_umi;
+    record->sequence = record->sequence.substr(trimmed_start, trimmed_end - trimmed_start);
+    record->quality = record->quality.substr(trimmed_start, trimmed_end - trimmed_start);
+    return true;
 }
 
-// Slide right->left: last match index, else -1
-static int find_from_end(const string &read_seq, const string &primer, int max_mismatch)
-{
-    int L = (int)primer.size();
-    int R = (int)read_seq.size();
-    if (L > R)
-        return -1;
-    for (int i = R - L; i >= 0; --i)
-    {
-        if (iupac_match_leq_mismatches(read_seq, i, primer, max_mismatch))
-            return i;
+bool ExtractReverseRead(
+    ont::fastq::Record* record,
+    const std::string& uppercase_sequence,
+    const PrimerLayout& layout,
+    const int max_mismatches) {
+    std::size_t left_start = 0;
+    std::size_t right_start = 0;
+    if (!TryFindPrimerSpan(
+            uppercase_sequence,
+            layout.reverse_primer,
+            layout.forward_primer_reverse_complement,
+            max_mismatches,
+            &left_start,
+            &right_start)) {
+        return false;
     }
-    return -1;
+
+    const std::string left_primer_region =
+        uppercase_sequence.substr(left_start, layout.reverse_primer.size());
+    const std::string right_primer_region =
+        uppercase_sequence.substr(right_start, layout.forward_primer.size());
+
+    const std::string left_umi =
+        ont::seq::ExtractIndexedBases(left_primer_region, layout.reverse_umi_positions);
+    const std::string right_umi = ont::seq::ExtractIndexedBases(
+        right_primer_region, layout.forward_reverse_complement_umi_positions);
+
+    const std::string forward_umi = ont::seq::ReverseComplement(right_umi);
+    const std::string reverse_umi = ont::seq::ReverseComplement(left_umi);
+
+    const std::string reverse_complement_sequence = ont::seq::ReverseComplement(record->sequence);
+    const std::string reverse_quality = ont::seq::ReverseQuality(record->quality);
+
+    const std::size_t reverse_left_start =
+        reverse_complement_sequence.size() - (right_start + layout.forward_primer.size());
+    const std::size_t reverse_right_start =
+        reverse_complement_sequence.size() - (left_start + layout.reverse_primer.size());
+
+    const std::size_t trimmed_start =
+        reverse_left_start + static_cast<std::size_t>(layout.forward_umi_positions.back()) + 1U;
+    const std::size_t trimmed_end =
+        reverse_right_start + static_cast<std::size_t>(layout.reverse_reverse_complement_umi_positions.front());
+    if (trimmed_end < trimmed_start) {
+        return false;
+    }
+
+    record->header += ":UMI_" + forward_umi + "_" + reverse_umi;
+    record->sequence = reverse_complement_sequence.substr(trimmed_start, trimmed_end - trimmed_start);
+    record->quality = reverse_quality.substr(trimmed_start, trimmed_end - trimmed_start);
+    return true;
 }
 
-// Extract UMI bases from region sequence given UMI positions
-static string extract_umi_from_region(const string &region_seq, const vector<int> &umi_pos)
-{
-    string out;
-    out.reserve(umi_pos.size());
-    for (int pos : umi_pos)
-    {
-        if (pos >= 0 && pos < (int)region_seq.size())
-            out.push_back(region_seq[pos]);
+bool ExtractAndAnnotateRead(
+    ont::fastq::Record* record,
+    const PrimerLayout& layout,
+    const int max_mismatches) {
+    const std::string uppercase_sequence = ont::seq::ToUpperCopy(record->sequence);
+    if (ExtractForwardRead(record, uppercase_sequence, layout, max_mismatches)) {
+        return true;
     }
-    return out;
+    return ExtractReverseRead(record, uppercase_sequence, layout, max_mismatches);
 }
 
-// Core read processing function
-// Extract UMIs and append to header
-// Trim read to between primers (exclusive of UMIs)
-// Reverse strand will be converted to forward strand.
-// Primer Format: IlluminaLandingPad_UMI_SequenceBindingRegion
-static bool process_record(
-    FastqRecord &rec,
-    const string &fwd, const string &rev,
-    const string &fwd_rc, const string &rev_rc,
-    int max_mismatch,
-    const vector<int> &f_umi_pos,
-    const vector<int> &r_umi_pos,
-    const vector<int> &frc_umi_pos,
-    const vector<int> &rrc_umi_pos)
-{
-    string seq = rec.seq;
-    for (char &c : seq)
-        c = up(c);
+}  // namespace
 
-    const int Lf = (int)fwd.size();
-    const int Lr = (int)rev.size();
-    if(f_umi_pos.empty() || r_umi_pos.empty() || frc_umi_pos.empty() || rrc_umi_pos.empty())
-        return false; // No UMI positions found
-    // Orientation A: F ... rc(R)
-    // Forward strand
-    {
-        int left_idx = find_from_start(seq, fwd, max_mismatch);
-        int right_idx = find_from_end(seq, rev_rc, max_mismatch);
-        if (left_idx >= 0 && right_idx >= 0 && left_idx + Lf <= right_idx)
-        {
-            string start_region = seq.substr(left_idx, Lf);
-            string end_region = seq.substr(right_idx, Lr);
-            string umi1 = extract_umi_from_region(start_region, f_umi_pos);
-            string umi2 = extract_umi_from_region(end_region, rrc_umi_pos);
-            rec.id += ":UMI_" + umi1 + "_" + umi2;
-            int left_end = left_idx + f_umi_pos.back() + 1;
-            int extend_length = right_idx - left_end + rrc_umi_pos.front();
-            rec.seq = rec.seq.substr(left_end, extend_length);
-            rec.qual = rec.qual.substr(left_end, extend_length);
-            return true;
-        }
+int main(int argc, char** argv) {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    if (argc != 6) {
+        PrintUsage(argv[0]);
+        return 1;
     }
-    // Orientation B: R ... rc(F)
-    // Reverse strand
-    {
-        int left_idx = find_from_start(seq, rev, max_mismatch);
-        int right_idx = find_from_end(seq, fwd_rc, max_mismatch);
-        if (left_idx >= 0 && right_idx >= 0 && left_idx + Lr <= right_idx)
-        {
-            string start_region = seq.substr(left_idx, Lr);
-            string end_region = seq.substr(right_idx, Lf);
-            string umi1 = extract_umi_from_region(start_region, r_umi_pos);
-            string umi2 = extract_umi_from_region(end_region, frc_umi_pos);
-            // Reverse the UMI order for reverse strand
-            string temp = umi1;
-            umi1 = to_rc(umi2);
-            umi2 = to_rc(temp);
-            rec.id += ":UMI_" + umi1 + "_" + umi2;
-            // Reverse-complement the sequence and quality
-            string rc_seq = to_rc(rec.seq);
-            string rc_qual = reverse_quality(rec.qual);
-            int left_idx_rc = rc_seq.size() - (right_idx + Lf);
-            int right_idx_rc = rc_seq.size() - (left_idx + Lr);
-            int left_end = left_idx_rc + f_umi_pos.back() + 1;
-            int extend_length = right_idx_rc - left_end + rrc_umi_pos.front();
-            rec.seq = rc_seq.substr(left_end, extend_length);
-            rec.qual = rc_qual.substr(left_end, extend_length);
-            return true;
-        }
+
+    const std::string input_fastq = argv[1];
+    const std::string output_fastq = argv[2];
+
+    PrimerLayout layout;
+    layout.forward_primer = ont::seq::ToUpperCopy(argv[3]);
+    layout.reverse_primer = ont::seq::ToUpperCopy(argv[4]);
+    layout.forward_primer_reverse_complement = ont::seq::ReverseComplement(layout.forward_primer);
+    layout.reverse_primer_reverse_complement = ont::seq::ReverseComplement(layout.reverse_primer);
+    layout.forward_umi_positions = ont::seq::AmbiguousPositions(layout.forward_primer);
+    layout.reverse_umi_positions = ont::seq::AmbiguousPositions(layout.reverse_primer);
+    layout.forward_reverse_complement_umi_positions =
+        ont::seq::AmbiguousPositions(layout.forward_primer_reverse_complement);
+    layout.reverse_reverse_complement_umi_positions =
+        ont::seq::AmbiguousPositions(layout.reverse_primer_reverse_complement);
+
+    if (layout.forward_umi_positions.empty() ||
+        layout.reverse_umi_positions.empty() ||
+        layout.forward_reverse_complement_umi_positions.empty() ||
+        layout.reverse_reverse_complement_umi_positions.empty()) {
+        std::cerr << "Error: both primer sequences must include at least one ambiguous UMI position.\n";
+        return 1;
     }
-    return false;
-}
 
-// ──────────────────────────────────────────────────────────────────────────────
-// main
-// ──────────────────────────────────────────────────────────────────────────────
-int main(int argc, char **argv)
-{
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
-
-    /*
-    * input.fastq: Input FASTQ file
-    * output.fastq: Output FASTQ file
-    * forward_primer: Forward primer sequence (IUPAC allowed)
-    * reverse_primer: Reverse primer sequence (IUPAC allowed)
-    * max_mismatch N: maximum allowed mismatches per primer
-    * reverse read will be transformed to forward read in output.fastq
-    */
-    // Parse CLI args
-    if (argc != 6)
-    {
-        cerr << "Usage: " << argv[0] << " <input.fastq> <output.fastq> <forward_primer> <reverse_primer> <max_mismatch>\n";
-        exit(1);
+    int max_mismatches = 0;
+    try {
+        max_mismatches = std::stoi(argv[5]);
+    } catch (const std::exception&) {
+        std::cerr << "Error: max_mismatch must be an integer.\n";
+        return 1;
     }
-    const string in_fastq = argv[1];
-    const string out_fastq = argv[2];
-    string fwd = argv[3];
-    string rev = argv[4];
-    int max_mismatch = stoi(argv[5]);
+    if (max_mismatches < 0) {
+        std::cerr << "Error: max_mismatch must be non-negative.\n";
+        return 1;
+    }
 
-    // Uppercase primers
-    transform(fwd.begin(), fwd.end(), fwd.begin(), up);
-    transform(rev.begin(), rev.end(), rev.begin(), up);
+    std::uint64_t total_reads = 0;
+    std::uint64_t kept_reads = 0;
+    std::uint64_t dropped_reads = 0;
 
-    // Build IUPAC bit masks.
-    init_iupac();
+    try {
+        ont::fastq::Reader reader(input_fastq);
+        ont::fastq::Writer writer(output_fastq);
 
-    // Precompute reverse-complements and UMI positions
-    const string fwd_rc = to_rc(fwd);
-    const string rev_rc = to_rc(rev);
-
-    const vector<int> f_umi_pos = umi_mask(fwd);
-    const vector<int> r_umi_pos = umi_mask(rev);
-    const vector<int> frc_umi_pos = umi_mask(fwd_rc);
-    const vector<int> rrc_umi_pos = umi_mask(rev_rc);
-
-    uint64_t n_total = 0, n_kept = 0, n_dropped = 0;
-
-    try
-    {
-        FastqReader reader(in_fastq);
-        FastqWriter writer(out_fastq);
-
-        FastqRecord rec;
-        while (reader.next(rec))
-        {
-            ++n_total;
-            if (rec.seq.size() != rec.qual.size())
-            {
-                ++n_dropped;
-                continue;
-            }
-            FastqRecord out = rec;
-            if (process_record(out, fwd, rev, fwd_rc, rev_rc, max_mismatch,
-                               f_umi_pos, r_umi_pos, frc_umi_pos, rrc_umi_pos))
-            {
-                writer.write(out);
-                ++n_kept;
-            }
-            else
-            {
-                ++n_dropped;
+        ont::fastq::Record record;
+        while (reader.Next(record)) {
+            ++total_reads;
+            ont::fastq::Record annotated_record = record;
+            if (ExtractAndAnnotateRead(&annotated_record, layout, max_mismatches)) {
+                writer.Write(annotated_record);
+                ++kept_reads;
+            } else {
+                ++dropped_reads;
             }
         }
-
-        std::cerr << "[UmiExtractor] total=" << n_total
-                  << " kept=" << n_kept
-                  << " dropped=" << n_dropped
-                  << " (mismatches per primer <= " << max_mismatch << ")\n";
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "ERROR: " << e.what() << "\n";
+    } catch (const std::exception& exception) {
+        std::cerr << "Error: " << exception.what() << "\n";
         return 2;
     }
+
+    std::cerr << "[UmiExtractor] total=" << total_reads
+              << " kept=" << kept_reads
+              << " dropped=" << dropped_reads
+              << " max_mismatch=" << max_mismatches << "\n";
     return 0;
 }

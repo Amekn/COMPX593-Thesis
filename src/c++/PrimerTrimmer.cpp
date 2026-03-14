@@ -1,394 +1,153 @@
-/*
-Usage: PrimerTrimmer <input.fastq> <output.fastq> <forward_primer> <reverse_primer> <max_mismatch>
-    input.fastq: Input FASTQ file
-    output.fastq: Output FASTQ file
-    forward_primer: Forward primer sequence (IUPAC allowed) 
-    reverse_primer: Reverse primer sequence (IUPAC allowed)
-    max_mismatch: Maximum number of mismatches allowed in primer matching
-
-Description: 
-    This program processes FASTQ files to trim both end of the reads based on provided forward and reverse primer sequences.
-    The sequences beyond the primer sequence are trimed (each post-processed sequence must start with a primer and ends with a primer)
-    A certain number of mismatches are allowed when matching primers.
-    IPUAC codes are supported in primer sequences.
-    All reverse read strands are converted to forward strands.
-*/
-
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <algorithm>
-#include <stdexcept>
-#include <cctype>
 #include <cstdint>
+#include <iostream>
+#include <string>
 
-using namespace std;
+#include "ont_tools/Fastq.hpp"
+#include "ont_tools/Sequence.hpp"
 
-static uint8_t IUPAC_bits[256];
-static char IUPAC_comp[256];
+namespace {
 
-static inline char up(char c)
-{
-    return static_cast<char>(toupper(static_cast<unsigned char>(c)));
+void PrintUsage(const char* program_name) {
+    std::cerr
+        << "Usage: " << program_name
+        << " <input.fastq> <output.fastq> <forward_primer> <reverse_primer> <max_mismatch>\n\n"
+        << "Trim reads to the span bracketed by the primer pair.\n"
+        << "Forward-oriented reads are emitted unchanged; reverse-oriented reads are reverse-complemented.\n";
 }
 
-
-static inline uint8_t base_bit(char b)
-{
-    switch (b)
-    {
-    case 'A':
-        return 1;
-    case 'C':
-        return 2;
-    case 'G':
-        return 4;
-    case 'T':
-        return 8;
-    default:
-        return 0; // non-ACGT in read -> mismatch unless primer allows none
-    }
-}
-
-static string to_rc(const string &s)
-{
-    const size_t n = s.size();
-    string out;
-    out.resize(n);
-    for (size_t i = 0; i < n; ++i)
-    {
-        // read from end to start
-        char c = up(s[n - 1 - i]);
-        // complement
-        char cc = IUPAC_comp[static_cast<unsigned char>(c)];
-        // write from start to end
-        out[i] = cc;
-    }
-    return out;
-}
-
-static string reverse_quality(const string &qual)
-{
-    const size_t n = qual.size();
-    string out;
-    out.resize(n);
-    for (size_t i = 0; i < n; ++i)
-    {
-        out[i] = qual[n - 1 - i];
-    }
-    return out;
-}
-
-struct FastqRecord
-{
-    string id;
-    string seq;
-    string plus;
-    string qual;
-};
-
-class FastqReader
-{
-public:
-    explicit FastqReader(const string &path) : in_(path)
-    {
-        if (!in_.is_open())
-            throw std::runtime_error("Failed to open input: " + path);
-    }
-    bool next(FastqRecord &rec)
-    {
-        string l1, l2, l3, l4;
-        if (!std::getline(in_, l1))
-            return false;
-        if (!std::getline(in_, l2))
-            return false;
-        if (!std::getline(in_, l3))
-            return false;
-        if (!std::getline(in_, l4))
-            return false;
-        if (l1.empty() || l1[0] != '@')
-            return false;
-        rec.id = l1;
-        rec.seq = l2;
-        rec.plus = l3;
-        rec.qual = l4;
-        return true;
+bool TryFindPrimerSpan(
+    const std::string& uppercase_sequence,
+    const std::string& left_primer,
+    const std::string& right_primer,
+    const int max_mismatches,
+    std::size_t* left_start,
+    std::size_t* right_start) {
+    const int left_index = ont::seq::FindPrimerFromLeft(uppercase_sequence, left_primer, max_mismatches);
+    const int right_index = ont::seq::FindPrimerFromRight(uppercase_sequence, right_primer, max_mismatches);
+    if (left_index < 0 || right_index < 0) {
+        return false;
     }
 
-private:
-    std::ifstream in_;
-};
-
-class FastqWriter
-{
-public:
-    explicit FastqWriter(const string &path) : out_(path)
-    {
-        if (!out_.is_open())
-            throw std::runtime_error("Failed to open output: " + path);
-    }
-    void write(const FastqRecord &rec)
-    {
-        out_ << rec.id << '\n'
-             << rec.seq << '\n'
-             << rec.plus << '\n'
-             << rec.qual << '\n';
+    const std::size_t left_start_index = static_cast<std::size_t>(left_index);
+    const std::size_t right_start_index = static_cast<std::size_t>(right_index);
+    if (left_start_index + left_primer.size() > right_start_index) {
+        return false;
     }
 
-private:
-    std::ofstream out_;
-};
-
-static void init_iupac()
-{
-    auto set_code = [](char c, const char *allowed)
-    {
-        uint8_t bits = 0;
-        for (const char *p = allowed; *p; ++p)
-            bits |= base_bit(*p);
-        IUPAC_bits[static_cast<unsigned char>(c)] = bits;
-    };
-
-    // Zero-init then set
-    for (int i = 0; i < 256; ++i)
-    {
-        IUPAC_bits[i] = 0;
-        IUPAC_comp[i] = '?';
-    }
-
-    set_code('A', "A");
-    set_code('C', "C");
-    set_code('G', "G");
-    set_code('T', "T");
-    set_code('R', "AG");
-    set_code('Y', "CT");
-    set_code('S', "GC");
-    set_code('W', "AT");
-    set_code('K', "GT");
-    set_code('M', "AC");
-    set_code('B', "CGT");
-    set_code('D', "AGT");
-    set_code('H', "ACT");
-    set_code('V', "ACG");
-    set_code('N', "ACGT");
-
-    IUPAC_comp[(unsigned char)'A'] = 'T';
-    IUPAC_comp[(unsigned char)'C'] = 'G';
-    IUPAC_comp[(unsigned char)'G'] = 'C';
-    IUPAC_comp[(unsigned char)'T'] = 'A';
-    IUPAC_comp[(unsigned char)'R'] = 'Y';
-    IUPAC_comp[(unsigned char)'Y'] = 'R';
-    IUPAC_comp[(unsigned char)'S'] = 'S';
-    IUPAC_comp[(unsigned char)'W'] = 'W';
-    IUPAC_comp[(unsigned char)'K'] = 'M';
-    IUPAC_comp[(unsigned char)'M'] = 'K';
-    IUPAC_comp[(unsigned char)'B'] = 'V';
-    IUPAC_comp[(unsigned char)'D'] = 'H';
-    IUPAC_comp[(unsigned char)'H'] = 'D';
-    IUPAC_comp[(unsigned char)'V'] = 'B';
-    IUPAC_comp[(unsigned char)'N'] = 'N';
-}
-
-
-
-// Any non-ACGT in primer marks a UMI position
-static vector<int> umi_mask(const string &primer)
-{
-    vector<int> pos;
-    for (int i = 0; i < (int)primer.size(); ++i)
-    {
-        char c = up(primer[i]);
-        if (c != 'A' && c != 'C' && c != 'G' && c != 'T')
-            pos.push_back(i);
-    }
-    return pos;
-}
-
-// IUPAC-aware match with <= max_mismatch
-static inline bool iupac_match_leq_mismatches(const string &read_seq, int start,
-                                              const string &primer, int max_mismatch)
-{
-    int mm = 0;
-    const int L = (int)primer.size();
-    for (int i = 0; i < L; ++i)
-    {
-        char r = up(read_seq[start + i]);
-        char p = up(primer[i]);
-        uint8_t allowed = IUPAC_bits[static_cast<unsigned char>(p)];
-        uint8_t rb = base_bit(r);
-        // 1. If the nucleotide in the sequence is allowed at given primer position then match, else mismatch.
-        if ((rb & allowed) == 0)
-        {
-            if (++mm > max_mismatch)
-                return false;
-        }
-    }
+    *left_start = left_start_index;
+    *right_start = right_start_index;
     return true;
 }
 
-// Slide left->right: first match index, else -1
-static int find_from_start(const string &read_seq, const string &primer, int max_mismatch)
-{
-    int L = (int)primer.size();
-    int R = (int)read_seq.size();
-    // 1. Primer cannot be longer than sequence
-    if (L > R)
-        return -1;
-    // 2. Slide window search from the beginning of the read
-    for (int i = 0; i <= R - L; ++i)
-    {   
-        // 3. Check the number of mismatches in the current window
-        if (iupac_match_leq_mismatches(read_seq, i, primer, max_mismatch))
-            return i;
-    }
-    // 4. No match found
-    return -1;
-}
+bool TrimRead(
+    ont::fastq::Record* record,
+    const std::string& forward_primer,
+    const std::string& reverse_primer,
+    const std::string& forward_primer_reverse_complement,
+    const std::string& reverse_primer_reverse_complement,
+    const int max_mismatches) {
+    const std::string uppercase_sequence = ont::seq::ToUpperCopy(record->sequence);
 
-// Slide right->left: last match index, else -1
-static int find_from_end(const string &read_seq, const string &primer, int max_mismatch)
-{
-    int L = (int)primer.size();
-    int R = (int)read_seq.size();
-    if (L > R)
-        return -1;
-    // 2. Slide window search from the end of the read
-    for (int i = R - L; i >= 0; --i)
-    {
-        if (iupac_match_leq_mismatches(read_seq, i, primer, max_mismatch))
-            return i;
-    }
-    return -1;
-}
+    std::size_t left_start = 0;
+    std::size_t right_start = 0;
 
-// Extract UMI bases from region sequence given UMI positions
-static string extract_umi_from_region(const string &region_seq, const vector<int> &umi_pos)
-{
-    string out;
-    out.reserve(umi_pos.size());
-    for (int pos : umi_pos)
-    {
-        if (pos >= 0 && pos < (int)region_seq.size())
-            out.push_back(region_seq[pos]);
+    if (TryFindPrimerSpan(
+            uppercase_sequence,
+            forward_primer,
+            reverse_primer_reverse_complement,
+            max_mismatches,
+            &left_start,
+            &right_start)) {
+        const std::size_t span_length =
+            right_start + reverse_primer_reverse_complement.size() - left_start;
+        record->sequence = record->sequence.substr(left_start, span_length);
+        record->quality = record->quality.substr(left_start, span_length);
+        return true;
     }
-    return out;
-}
 
-// Core read processing function
-// Extract UMIs and append to header
-// Trim read to between primers (exclusive of UMIs)
-// Reverse strand will be converted to forward strand.
-// Primer Format: IlluminaLandingPad_UMI_SequenceBindingRegion
-static bool process_record(
-    FastqRecord &rec,
-    const string &fwd, const string &rev,
-    const string &fwd_rc, const string &rev_rc,
-    int max_mismatch)
-{
-    // Copy & Uppercase each nucleotides in the sequence
-    string seq = rec.seq;
-    for (char &c : seq)
-        c = up(c);
-
-    // Retrieve the size of forward & reverse primers
-    const int Lf = (int)fwd.size();
-    const int Lr = (int)rev.size();
-
-    // If read is a forward strand then: F ... rc(R)
-    {
-        int left_idx = find_from_start(seq, fwd, max_mismatch);
-        int right_idx = find_from_end(seq, rev_rc, max_mismatch);
-        if (left_idx >= 0 && right_idx >= 0 && left_idx + Lf <= right_idx)
-        {
-            int extend_length = right_idx - left_idx + Lr;
-            rec.seq = rec.seq.substr(left_idx, extend_length);
-            rec.qual = rec.qual.substr(left_idx, extend_length);
-            return true;
-        }
+    if (TryFindPrimerSpan(
+            uppercase_sequence,
+            reverse_primer,
+            forward_primer_reverse_complement,
+            max_mismatches,
+            &left_start,
+            &right_start)) {
+        const std::size_t span_length =
+            right_start + forward_primer_reverse_complement.size() - left_start;
+        record->sequence =
+            ont::seq::ReverseComplement(record->sequence.substr(left_start, span_length));
+        record->quality = ont::seq::ReverseQuality(record->quality.substr(left_start, span_length));
+        return true;
     }
-    // If read is a reverse strand then: R ... rc(F)
-    {
-        int left_idx = find_from_start(seq, rev, max_mismatch);
-        int right_idx = find_from_end(seq, fwd_rc, max_mismatch);
-        if (left_idx >= 0 && right_idx >= 0 && left_idx + Lr <= right_idx)
-        {
-            int extend_length = right_idx - left_idx + Lf;
-            rec.seq = to_rc(rec.seq.substr(left_idx, extend_length));
-            rec.qual = reverse_quality(rec.qual.substr(left_idx, extend_length));
-            return true;
-        }
-    }
+
     return false;
 }
 
-int main(int argc, char **argv)
-{
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+}  // namespace
 
-    // Parse CLI args
-    if (argc < 6)
-    {
-        cerr << "Usage: " << argv[0] << " <input.fastq> <output.fastq> <forward_primer> <reverse_primer> <max_mismatch>\n";
-        exit(1);
+int main(int argc, char** argv) {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    if (argc != 6) {
+        PrintUsage(argv[0]);
+        return 1;
     }
 
-    const string in_fastq = argv[1];
-    const string out_fastq = argv[2];
-    string fwd = argv[3];
-    string rev = argv[4];
-    int max_mismatch = stoi(argv[5]);
+    const std::string input_fastq = argv[1];
+    const std::string output_fastq = argv[2];
+    std::string forward_primer = ont::seq::ToUpperCopy(argv[3]);
+    std::string reverse_primer = ont::seq::ToUpperCopy(argv[4]);
 
-    // Uppercase primers
-    transform(fwd.begin(), fwd.end(), fwd.begin(), up);
-    transform(rev.begin(), rev.end(), rev.begin(), up);
+    int max_mismatches = 0;
+    try {
+        max_mismatches = std::stoi(argv[5]);
+    } catch (const std::exception&) {
+        std::cerr << "Error: max_mismatch must be an integer.\n";
+        return 1;
+    }
+    if (max_mismatches < 0) {
+        std::cerr << "Error: max_mismatch must be non-negative.\n";
+        return 1;
+    }
 
-    // Build IUPAC bit masks.
-    init_iupac();
+    const std::string forward_primer_reverse_complement =
+        ont::seq::ReverseComplement(forward_primer);
+    const std::string reverse_primer_reverse_complement =
+        ont::seq::ReverseComplement(reverse_primer);
 
-    // Precompute reverse-complements
-    // Both standard nucleotide and ambiguous nucleotide are converted to their complements.
-    const string fwd_rc = to_rc(fwd);
-    const string rev_rc = to_rc(rev);
+    std::uint64_t total_reads = 0;
+    std::uint64_t kept_reads = 0;
+    std::uint64_t dropped_reads = 0;
 
-    // Read failed trim process will be dropped.   
-    uint64_t n_total = 0, n_kept = 0, n_dropped = 0;
+    try {
+        ont::fastq::Reader reader(input_fastq);
+        ont::fastq::Writer writer(output_fastq);
 
-    try
-    {
-        FastqReader reader(in_fastq);
-        FastqWriter writer(out_fastq);
-
-        FastqRecord rec;
-        while (reader.next(rec))
-        {
-            ++n_total;
-            if (rec.seq.size() != rec.qual.size())
-            {
-                ++n_dropped;
-                continue;
-            }
-            FastqRecord out = rec;
-            if (process_record(out, fwd, rev, fwd_rc, rev_rc, max_mismatch))
-            {
-                writer.write(out);
-                ++n_kept;
-            }
-            else
-            {
-                ++n_dropped;
+        ont::fastq::Record record;
+        while (reader.Next(record)) {
+            ++total_reads;
+            ont::fastq::Record trimmed_record = record;
+            if (TrimRead(
+                    &trimmed_record,
+                    forward_primer,
+                    reverse_primer,
+                    forward_primer_reverse_complement,
+                    reverse_primer_reverse_complement,
+                    max_mismatches)) {
+                writer.Write(trimmed_record);
+                ++kept_reads;
+            } else {
+                ++dropped_reads;
             }
         }
-
-        std::cerr << "[PrimerTrimmer] total=" << n_total
-                  << " kept=" << n_kept
-                  << " dropped=" << n_dropped << "\n";
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "ERROR: " << e.what() << "\n";
+    } catch (const std::exception& exception) {
+        std::cerr << "Error: " << exception.what() << "\n";
         return 2;
     }
+
+    std::cerr << "[PrimerTrimmer] total=" << total_reads
+              << " kept=" << kept_reads
+              << " dropped=" << dropped_reads << "\n";
     return 0;
 }
