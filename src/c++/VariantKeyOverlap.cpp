@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
                 cout << datasets[i].id << '\t' << datasets[j].id << '\t' << shared << '\t' << jaccard << '\n';
             }
         }
-
+        
         cout << "\n# OverlapByMultiplicity\n";
         cout << "datasets_present\tvariant_count\n";
         for (size_t k = 1; k <= n; ++k) {
@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
         for (const auto& item : pattern_items) {
             cout << item.first << '\t' << item.second << '\n';
         }
-
+       
         return 0;
     } catch (const exception& e) {
         cerr << "Error: " << e.what() << "\n";

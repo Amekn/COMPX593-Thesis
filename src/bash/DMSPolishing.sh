@@ -92,6 +92,12 @@ require_file() {
   [[ -f "$path" ]] || die "$label does not exist: $path"
 }
 
+require_path() {
+  local path=$1
+  local label=$2
+  [[ -e "$path" ]] || die "$label does not exist: $path"
+}
+
 main() {
   local model_path=""
   local pod5_path=""
@@ -199,8 +205,8 @@ main() {
   if [[ -n "$basecall_bam" ]]; then
     require_file "$basecall_bam" "Input BAM"
   else
-    require_file "$model_path" "Model"
-    require_file "$pod5_path" "POD5 input"
+    require_path "$model_path" "Model"
+    require_path "$pod5_path" "POD5 input"
     require_command dorado
   fi
 
@@ -224,6 +230,7 @@ main() {
   local output_prefix=${output_fastq%.fastq}
   output_prefix=${output_prefix%.fq}
   local timeline_log="${output_prefix}.timeline.log"
+  local output_tsv="${output_prefix}.tsv"
 
   mkdir -p "$(dirname "$output_fastq")"
   exec > >(tee -a "$timeline_log") 2>&1
@@ -241,6 +248,7 @@ main() {
   log "zone_string     = $zone_string"
   log "threads         = $threads"
   log "timeline_log    = $timeline_log"
+  log "output_tsv      = $output_tsv"
   log "filter_binary   = $filter_binary"
 
   if [[ -n "$basecall_bam" ]]; then
@@ -288,7 +296,7 @@ main() {
   log "primary_bam     = $primary_name_sorted_bam"
 
   step "Summarise primary alignments"
-  "$calc_stats_script" "$primary_name_sorted_bam"
+  bash "$calc_stats_script" "$primary_name_sorted_bam"
 
   step "Polish reads with DualSiteDMSFilter"
   "$filter_binary" \
@@ -298,7 +306,8 @@ main() {
     "$zone_string" \
     --max-indel-events "$max_indel_events" \
     --max-indel-bases "$max_indel_bases" \
-    --mut-codon-library "$mutant_codon_library"
+    --mut-codon-library "$mutant_codon_library"\
+    --out-counts "$output_tsv"
   log "polished_fastq  = $output_fastq"
 
   step "Align polished reads"
@@ -308,7 +317,7 @@ main() {
   log "polished_bam    = $polished_aligned_bam"
 
   step "Summarise polished alignments"
-  "$calc_stats_script" "$polished_aligned_bam"
+  bash "$calc_stats_script" "$polished_aligned_bam"
 
   step "Pipeline complete"
   log "primary_bam_pre_polish = $primary_name_sorted_bam"

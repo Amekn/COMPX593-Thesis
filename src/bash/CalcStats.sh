@@ -75,8 +75,10 @@ main() {
   require_command mktemp
 
   local temporary_stats
+  local cleanup_trap
   temporary_stats=$(mktemp)
-  trap 'rm -f "$temporary_stats"' EXIT
+  printf -v cleanup_trap 'rm -f -- %q' "$temporary_stats"
+  trap "$cleanup_trap" EXIT
 
   samtools stats "$bam_path" >"$temporary_stats"
 

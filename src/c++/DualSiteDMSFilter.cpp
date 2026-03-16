@@ -114,7 +114,6 @@ R"(Usage:
     --mut-codon-library <NNN|NNK>    (default: NNN; apply library design rule to mutated codons)
     --require-all-zones              (default: off; if set, require full coverage of ALL zones, not just first+last)
     --out-counts <tsv>               (optional: writes formatted variant key)
-    --out-pass-bam <bam>             (optional; writes PASSING READS UNCHANGED)
 
 Notes:
   - corrected FASTQ sequences are ALWAYS reference-length.
@@ -214,7 +213,6 @@ int main(int argc, char** argv) {
     MutantCodonLibrary mutant_codon_library = MutantCodonLibrary::NNN;
     bool require_all_zones = false;
     std::string out_counts;
-    std::string out_pass_bam;
 
     for (int i = 5; i < argc; i++) {
         std::string a = argv[i];
@@ -240,7 +238,6 @@ int main(int argc, char** argv) {
         }
         else if (a == "--require-all-zones") require_all_zones = true;
         else if (a == "--out-counts") out_counts = need("--out-counts");
-        else if (a == "--out-pass-bam") out_pass_bam = need("--out-pass-bam");
         else {
             std::cerr << "Unknown option: " << a << "\n";
             usage();
@@ -341,31 +338,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // Optional PASS BAM
-    samFile* out_bam = nullptr;
-    if (!out_pass_bam.empty()) {
-        out_bam = sam_open(out_pass_bam.c_str(), "wb");
-        if (!out_bam) {
-            std::cerr << "Failed to open output BAM: " << out_pass_bam << "\n";
-            bam_hdr_destroy(hdr);
-            sam_close(in);
-            fai_destroy(fai);
-            return 2;
-        }
-        if (sam_hdr_write(out_bam, hdr) < 0) {
-            std::cerr << "Failed to write output BAM header.\n";
-            sam_close(out_bam);
-            bam_hdr_destroy(hdr);
-            sam_close(in);
-            fai_destroy(fai);
-            return 2;
-        }
-    }
-
     std::ofstream out_fq_stream(out_fq);
     if (!out_fq_stream) {
         std::cerr << "Failed to open corrected FASTQ: " << out_fq << "\n";
-        if (out_bam) sam_close(out_bam);
         bam_hdr_destroy(hdr);
         sam_close(in);
         fai_destroy(fai);
@@ -375,7 +350,6 @@ int main(int argc, char** argv) {
     int contig_tid = bam_name2id(hdr, contig);
     if (contig_tid < 0) {
         std::cerr << "Contig not found in BAM header: " << contig << "\n";
-        if (out_bam) sam_close(out_bam);
         out_fq_stream.close();
         bam_hdr_destroy(hdr);
         sam_close(in);
@@ -386,7 +360,6 @@ int main(int argc, char** argv) {
     bam1_t* b = bam_init1();
     if (!b) {
         std::cerr << "Failed to allocate bam record.\n";
-        if (out_bam) sam_close(out_bam);
         out_fq_stream.close();
         bam_hdr_destroy(hdr);
         sam_close(in);
@@ -728,12 +701,6 @@ int main(int argc, char** argv) {
                       << " contig=" << contig << "\n";
         out_fq_stream << corrected_seq << "\n+\n" << corrected_qual << "\n";
 
-        if (out_bam) {
-            if (sam_write1(out_bam, hdr, b) < 0) {
-                std::cerr << "Warning: failed writing passing read to BAM.\n";
-            }
-        }
-
         n_pass++;
     }
 
@@ -752,7 +719,6 @@ int main(int argc, char** argv) {
         if (!ofs) {
             std::cerr << "Failed to open output counts file: " << out_counts << "\n";
             bam_destroy1(b);
-            if (out_bam) sam_close(out_bam);
             bam_hdr_destroy(hdr);
             sam_close(in);
             fai_destroy(fai);
@@ -841,11 +807,9 @@ int main(int argc, char** argv) {
     std::cerr << "avg_net_codon_mismatches_per_read=" << net_avg_codon_mis << "\n";
 
     if (!out_counts.empty()) std::cerr << "out_counts=" << out_counts << "\n";
-    if (!out_pass_bam.empty()) std::cerr << "out_pass_bam=" << out_pass_bam << " (unchanged)\n";
 
     // Cleanup
     bam_destroy1(b);
-    if (out_bam) sam_close(out_bam);
     bam_hdr_destroy(hdr);
     sam_close(in);
     fai_destroy(fai);
