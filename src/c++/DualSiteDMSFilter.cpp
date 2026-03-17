@@ -765,46 +765,46 @@ int main(int argc, char** argv) {
     double avg_codon_mis = (n_pass ? (double)sum_codon_mismatches / (double)n_pass : 0.0);
     double avg_fw_nt_mis = (n_pass ? (double)sum_fw_nt_mismatches / (double)n_pass : 0.0);
     double avg_fw_codon_mis = (n_pass ? (double)sum_fw_codon_mismatches / (double)n_pass : 0.0);
-
-    std::cerr << "avg_nucleotide_mismatches_per_read=" << avg_nt_mis << "\n";
-    std::cerr << "avg_codon_mismatches_per_read=" << avg_codon_mis << "\n";
+    // per-read net differences
+    double net_avg_nt_mis = avg_nt_mis - avg_fw_nt_mis;
+    double net_avg_codon_mis = avg_codon_mis - avg_fw_codon_mis;
+    if (net_avg_nt_mis < 0) net_avg_nt_mis = 0.0;
+    if (net_avg_codon_mis < 0) net_avg_codon_mis = 0.0;
+    
+    std::cerr << "avg_dms_nucleotide_mismatches_per_read=" << avg_nt_mis << "\n";
     std::cerr << "avg_framework_nucleotide_mismatches_per_read=" << avg_fw_nt_mis << "\n";
+    std::cerr << "avg_net_nucleotide_mismatches_per_read=" << net_avg_nt_mis << "\n";
+    std::cerr << "avg_dms_codon_mismatches_per_read=" << avg_codon_mis << "\n";
     std::cerr << "avg_framework_codon_mismatches_per_read=" << avg_fw_codon_mis << "\n";
+    std::cerr << "avg_net_codon_mismatches_per_read=" << net_avg_codon_mis << "\n";
 
-    // NEW: denominators
-    std::cerr << "zone_bases_compared=" << sum_zone_bases_compared << "\n";
+    // denominators
+    std::cerr << "dms_bases_compared=" << sum_zone_bases_compared << "\n";
     std::cerr << "framework_bases_compared=" << sum_fw_bases_compared << "\n";
-    std::cerr << "zone_codons_compared=" << sum_zone_codons_compared << "\n";
+    std::cerr << "dms_codons_compared=" << sum_zone_codons_compared << "\n";
     std::cerr << "framework_codons_compared=" << sum_fw_codons_compared << "\n";
 
-    // NEW: per-base mismatch rates
+    // per-base mismatch rates
     double zone_nt_rate = (sum_zone_bases_compared ? (double)sum_nt_mismatches / (double)sum_zone_bases_compared : 0.0);
     double fw_nt_rate   = (sum_fw_bases_compared   ? (double)sum_fw_nt_mismatches / (double)sum_fw_bases_compared   : 0.0);
     double net_nt_rate  = zone_nt_rate - fw_nt_rate;
     if (net_nt_rate < 0) net_nt_rate = 0.0;
 
-    std::cerr << "zone_nt_mismatch_rate_per_base=" << zone_nt_rate << "\n";
+    std::cerr << "dms_nt_mismatch_rate_per_base=" << zone_nt_rate << "\n";
     std::cerr << "framework_nt_mismatch_rate_per_base=" << fw_nt_rate << "\n";
     std::cerr << "net_nt_mismatch_rate_per_base=" << net_nt_rate << "\n";
 
-    // NEW: per-codon mismatch rates
+    // per-codon mismatch rates
     double zone_codon_rate = (sum_zone_codons_compared ? (double)sum_codon_mismatches / (double)sum_zone_codons_compared : 0.0);
     double fw_codon_rate   = (sum_fw_codons_compared   ? (double)sum_fw_codon_mismatches / (double)sum_fw_codons_compared   : 0.0);
     double net_codon_rate  = zone_codon_rate - fw_codon_rate;
     if (net_codon_rate < 0) net_codon_rate = 0.0;
 
-    std::cerr << "zone_codon_mismatch_rate_per_codon=" << zone_codon_rate << "\n";
+    std::cerr << "dms_codon_mismatch_rate_per_codon=" << zone_codon_rate << "\n";
     std::cerr << "framework_codon_mismatch_rate_per_codon=" << fw_codon_rate << "\n";
     std::cerr << "net_codon_mismatch_rate_per_codon=" << net_codon_rate << "\n";
 
-    // Optional: per-read net differences too (sometimes useful sanity check)
-    double net_avg_nt_mis = avg_nt_mis - avg_fw_nt_mis;
-    double net_avg_codon_mis = avg_codon_mis - avg_fw_codon_mis;
-    if (net_avg_nt_mis < 0) net_avg_nt_mis = 0.0;
-    if (net_avg_codon_mis < 0) net_avg_codon_mis = 0.0;
 
-    std::cerr << "avg_net_nucleotide_mismatches_per_read=" << net_avg_nt_mis << "\n";
-    std::cerr << "avg_net_codon_mismatches_per_read=" << net_avg_codon_mis << "\n";
 
     if (!out_counts.empty()) std::cerr << "out_counts=" << out_counts << "\n";
 
