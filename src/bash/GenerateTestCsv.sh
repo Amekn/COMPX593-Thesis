@@ -112,7 +112,7 @@ clear_fastq_state() {
   rm -f -- "$fastq_path" "$(fastq_marker_path "$fastq_path")"
 }
 
-validate_fastq_file() {
+fastq_read_count() {
   local fastq_path=$1
 
   python3 - "$fastq_path" <<'PY'
@@ -156,7 +156,36 @@ with open_fastq(path) as handle:
                 f"Sequence/quality length mismatch in {path} at record {record_count}: "
                 f"{len(sequence)} != {len(quality)}"
             )
+
+print(record_count)
 PY
+}
+
+validate_fastq_file() {
+  local fastq_path=$1
+  fastq_read_count "$fastq_path" >/dev/null
+}
+
+bam_record_count() {
+  local bam_path=$1
+  samtools view -c "$bam_path"
+}
+
+alignment_fastq_matches_bam() {
+  local bam_path=$1
+  local fastq_path=$2
+  local bam_records
+  local fastq_records
+
+  bam_records=$(bam_record_count "$bam_path")
+  fastq_records=$(fastq_read_count "$fastq_path")
+
+  if [[ "$bam_records" != "$fastq_records" ]]; then
+    log "Detected BAM/FASTQ inconsistency: $bam_path has $bam_records records, but $fastq_path has $fastq_records reads"
+    return 1
+  fi
+
+  return 0
 }
 
 reuse_fastq_if_valid() {
@@ -631,20 +660,20 @@ key_map = {
     "pass_reads_2_codon_mutations": "pass_reads_2_codon_mutations",
     "pass_rate": "pass_rate",
     "unique_variants": "unique_variants",
-    "avg_nucleotide_mismatches_per_read": "avg_dms_nucleotide_mismatches_per_read",
+    "avg_dms_nucleotide_mismatches_per_read": "avg_dms_nucleotide_mismatches_per_read",
     "avg_framework_nucleotide_mismatches_per_read": "avg_framework_nucleotide_mismatches_per_read",
     "avg_net_nucleotide_mismatches_per_read": "avg_net_nucleotide_mismatches_per_read",
-    "avg_codon_mismatches_per_read": "avg_dms_codon_mismatches_per_read",
+    "avg_dms_codon_mismatches_per_read": "avg_dms_codon_mismatches_per_read",
     "avg_framework_codon_mismatches_per_read": "avg_framework_codon_mismatches_per_read",
     "avg_net_codon_mismatches_per_read": "avg_net_codon_mismatches_per_read",
-    "zone_bases_compared": "dms_bases_compared",
+    "dms_bases_compared": "dms_bases_compared",
     "framework_bases_compared": "framework_bases_compared",
-    "zone_codons_compared": "dms_codons_compared",
+    "dms_codons_compared": "dms_codons_compared",
     "framework_codons_compared": "framework_codons_compared",
-    "zone_nt_mismatch_rate_per_base": "dms_nt_mismatch_rate_per_base",
+    "dms_nt_mismatch_rate_per_base": "dms_nt_mismatch_rate_per_base",
     "framework_nt_mismatch_rate_per_base": "framework_nt_mismatch_rate_per_base",
     "net_nt_mismatch_rate_per_base": "net_nt_mismatch_rate_per_base",
-    "zone_codon_mismatch_rate_per_codon": "dms_codon_mismatch_rate_per_codon",
+    "dms_codon_mismatch_rate_per_codon": "dms_codon_mismatch_rate_per_codon",
     "framework_codon_mismatch_rate_per_codon": "framework_codon_mismatch_rate_per_codon",
     "net_codon_mismatch_rate_per_codon": "net_codon_mismatch_rate_per_codon",
 }
@@ -719,6 +748,14 @@ for path in sys.argv[1:]:
     with open(path) as handle:
         payload = json.load(handle)
     merged.update(payload)
+
+pre_length_filter_reads = int(merged.get("pre_length_filter_reads", "0") or 0)
+post_dms_filter_reads = int(merged.get("post_dms_filter_reads", "0") or 0)
+if pre_length_filter_reads == 0:
+    merged["pipeline_pass_rate"] = "0.0000000000"
+else:
+    merged["pipeline_pass_rate"] = f"{post_dms_filter_reads / pre_length_filter_reads:.10f}"
+
 json.dump(merged, sys.stdout, sort_keys=True)
 PY
 }
@@ -779,13 +816,20 @@ with template_csv.open(newline="") as in_handle, output_csv.open("w", newline=""
     except StopIteration:
         raise SystemExit(f"Template CSV is empty: {template_csv}")
 
+    template_header = list(header)
+    if "pipeline_pass_rate" not in header:
+        header = header + ["pipeline_pass_rate"]
+
     writer.writerow(header)
 
     for index, row in enumerate(reader, start=1):
+        if len(row) < len(template_header):
+            row = row + [""] * (len(template_header) - len(row))
+        elif len(row) > len(template_header):
+            row = row[: len(template_header)]
+
         if len(row) < len(header):
             row = row + [""] * (len(header) - len(row))
-        elif len(row) > len(header):
-            row = row[: len(header)]
 
         metrics_path = results_dir / f"{index}.json"
         if metrics_path.exists():
@@ -1040,8 +1084,11 @@ run_primary_alignment_if_needed() {
 
   if [[ -f "$primary_bam" && -f "$aligned_bam" ]] && reuse_fastq_if_valid "$aligned_fastq" "$force" "post-alignment FASTQ"; then
     if validate_bam_file "$primary_bam" && validate_bam_file "$aligned_bam"; then
-      log "Reusing existing primary alignment BAMs: $primary_bam"
-      return 0
+      if alignment_fastq_matches_bam "$primary_bam" "$aligned_fastq"; then
+        log "Reusing existing primary alignment BAMs: $primary_bam"
+        return 0
+      fi
+      log "Existing post-alignment FASTQ is inconsistent and will be regenerated: $aligned_fastq"
     fi
   fi
 
@@ -1069,6 +1116,8 @@ run_primary_alignment_if_needed() {
   validate_bam_file "$aligned_bam"
   validate_bam_file "$primary_bam"
   validate_fastq_file "$aligned_fastq"
+  alignment_fastq_matches_bam "$primary_bam" "$aligned_fastq" \
+    || die "Generated post-alignment FASTQ does not match primary BAM: $aligned_fastq"
   mark_fastq_valid "$aligned_fastq"
 }
 
@@ -1162,6 +1211,11 @@ build_row_metrics_json() {
   local post_dms_json="$row_dir/post_dms.json"
   local dms_json="$row_dir/dms.json"
   local polished_json="$row_dir/polished_alignment.json"
+
+  if [[ -f "$primary_bam" && -f "$aligned_fastq" ]]; then
+    alignment_fastq_matches_bam "$primary_bam" "$aligned_fastq" \
+      || die "Post-alignment FASTQ is inconsistent with primary BAM: $aligned_fastq"
+  fi
 
   compute_fastq_metrics_json "$base_fastq" "pre_length_filter_" >"$pre_json"
   compute_fastq_metrics_json "$length_filtered_fastq" "post_length_filter_" >"$post_length_json"

@@ -478,6 +478,35 @@ reuse_fastq_if_valid() {
   return 1
 }
 
+reuse_stage_fastq_if_valid() {
+  local input_fastq=$1
+  local output_fastq=$2
+  local force=$3
+  local label=$4
+  shift 4
+
+  if [[ -f "$output_fastq" && "$force" -eq 0 ]]; then
+    if [[ "$input_fastq" -nt "$output_fastq" ]]; then
+      log "Existing $label is older than its input and will be regenerated: $output_fastq"
+      return 1
+    fi
+
+    local required_artifact
+    for required_artifact in "$@"; do
+      if [[ ! -e "$required_artifact" ]]; then
+        log "Existing $label is missing a required artifact and will be regenerated: $required_artifact"
+        return 1
+      fi
+      if [[ "$input_fastq" -nt "$required_artifact" || "$output_fastq" -nt "$required_artifact" ]]; then
+        log "Existing $label has an outdated dependent artifact and will be regenerated: $required_artifact"
+        return 1
+      fi
+    done
+  fi
+
+  reuse_fastq_if_valid "$output_fastq" "$force" "$label"
+}
+
 prepare_output_csv_for_resume() {
   local output_csv=$1
   local existing_header
@@ -617,7 +646,14 @@ run_length_filter_if_needed() {
   local threads=$7
   local force=$8
 
-  if reuse_fastq_if_valid "$output_fastq" "$force" "length-filtered FASTQ"; then
+  if reuse_stage_fastq_if_valid \
+    "$input_fastq" \
+    "$output_fastq" \
+    "$force" \
+    "length-filtered FASTQ" \
+    "$report_html" \
+    "$report_json"
+  then
     return 0
   fi
 
@@ -666,7 +702,14 @@ run_quality_filter_if_needed() {
   local threads=$6
   local force=$7
 
-  if reuse_fastq_if_valid "$output_fastq" "$force" "quality-filtered FASTQ"; then
+  if reuse_stage_fastq_if_valid \
+    "$input_fastq" \
+    "$output_fastq" \
+    "$force" \
+    "quality-filtered FASTQ" \
+    "$report_html" \
+    "$report_json"
+  then
     return 0
   fi
 
@@ -716,7 +759,14 @@ run_alignment_if_needed() {
   local threads=$8
   local force=$9
 
-  if [[ -f "$primary_bam" ]] && reuse_fastq_if_valid "$aligned_fastq" "$force" "post-alignment FASTQ"; then
+  if [[ -f "$primary_bam" ]] && reuse_stage_fastq_if_valid \
+    "$input_fastq" \
+    "$aligned_fastq" \
+    "$force" \
+    "post-alignment FASTQ" \
+    "$aligned_bam" \
+    "$primary_bam"
+  then
     return 0
   fi
 
