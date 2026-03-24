@@ -27,14 +27,15 @@ Notes:
   - A row name matches files shaped like:
       *<name>.variants.tsv
       *<name>.*.variants.tsv
-  - "haplotype_threshold" may be a single integer or a "-" separated list,
+  - "variant_threshold" may be a single integer or a "-" separated list,
     for example: 1-2-5-10
   - Output metric columns are suffixed by threshold value, for example:
-      source_haplotypes_1
-      source_haplotypes_2
+      source_variants_1
+      source_variants_2
   - Missing metric columns are appended automatically when the template does
     not provide enough threshold-specific output columns.
-  - If the CSV does not contain "haplotype_threshold", the script uses 1.
+  - Legacy "haplotype_*" column names are normalised automatically.
+  - If the CSV does not contain "variant_threshold", the script uses 1.
     Empty threshold cells also default to 1.
 EOF
 }
@@ -104,11 +105,11 @@ parse_threshold_list() {
   normalized_value=${normalized_value//:/-}
 
   IFS='-' read -r -a tokens <<< "$normalized_value"
-  (( ${#tokens[@]} > 0 )) || die "Invalid haplotype_threshold list: $raw_value"
+  (( ${#tokens[@]} > 0 )) || die "Invalid variant_threshold list: $raw_value"
 
   for token in "${tokens[@]}"; do
-    [[ -n "$token" ]] || die "Invalid haplotype_threshold list: $raw_value"
-    [[ "$token" =~ ^[0-9]+$ ]] || die "Invalid haplotype_threshold value: $token"
+    [[ -n "$token" ]] || die "Invalid variant_threshold list: $raw_value"
+    [[ "$token" =~ ^[0-9]+$ ]] || die "Invalid variant_threshold value: $token"
 
     canonical_threshold=$((10#$token))
     token=$canonical_threshold
@@ -118,6 +119,31 @@ parse_threshold_list() {
       destination+=("$token")
     fi
   done
+}
+
+normalize_legacy_header_field() {
+  local field=$1
+
+  case "$field" in
+    haplotype_threshold)
+      printf 'variant_threshold\n'
+      ;;
+    source_haplotypes_*)
+      printf 'source_variants_%s\n' "${field#source_haplotypes_}"
+      ;;
+    groundtruth_haplotypes_*)
+      printf 'groundtruth_variants_%s\n' "${field#groundtruth_haplotypes_}"
+      ;;
+    intersection_haplotypes_*)
+      printf 'intersection_variants_%s\n' "${field#intersection_haplotypes_}"
+      ;;
+    union_haplotypes_*)
+      printf 'union_variants_%s\n' "${field#union_haplotypes_}"
+      ;;
+    *)
+      printf '%s\n' "$field"
+      ;;
+  esac
 }
 
 sort_unique_numeric_values() {
@@ -273,10 +299,10 @@ main() {
   local source_dir=${positional_args[1]}
   local output_csv=${positional_args[2]}
   local metric_prefixes=(
-    source_haplotypes
-    groundtruth_haplotypes
-    intersection_haplotypes
-    union_haplotypes
+    source_variants
+    groundtruth_variants
+    intersection_variants
+    union_variants
     exact_overlap_mass
     weighted_jaccard
     jensen_shannon_similarity
@@ -317,9 +343,13 @@ main() {
 
   local -A column_index=()
   local index
+  local normalized_header
   for index in "${!header_fields[@]}"; do
     header_fields[index]=$(trim_whitespace "$(trim_cr "${header_fields[index]}")")
-    column_index["${header_fields[index]}"]=$index
+    normalized_header=$(normalize_legacy_header_field "${header_fields[index]}")
+    [[ ! -v "column_index[$normalized_header]" ]] || die "Template CSV contains duplicate or conflicting column: $normalized_header"
+    header_fields[index]=$normalized_header
+    column_index["$normalized_header"]=$index
   done
 
   local required_column
@@ -332,9 +362,9 @@ main() {
 
   local name_index=${column_index[name]}
   local ground_truth_index=${column_index[ground_truth]}
-  local haplotype_threshold_index=-1
-  if [[ -v "column_index[haplotype_threshold]" ]]; then
-    haplotype_threshold_index=${column_index[haplotype_threshold]}
+  local variant_threshold_index=-1
+  if [[ -v "column_index[variant_threshold]" ]]; then
+    variant_threshold_index=${column_index[variant_threshold]}
   fi
 
   local rows=()
@@ -364,8 +394,8 @@ main() {
     [[ -n "$row_name" ]] || die "Encountered a row with an empty name"
 
     row_threshold_text=''
-    if (( haplotype_threshold_index >= 0 )); then
-      row_threshold_text=${parsed_row[haplotype_threshold_index]}
+    if (( variant_threshold_index >= 0 )); then
+      row_threshold_text=${parsed_row[variant_threshold_index]}
     fi
     parse_threshold_list "$row_threshold_text" row_thresholds
     for threshold in "${row_thresholds[@]}"; do
@@ -427,8 +457,8 @@ main() {
     source_path=$(resolve_variant_path "$row_name" variant_files)
 
     row_threshold_text=''
-    if (( haplotype_threshold_index >= 0 )); then
-      row_threshold_text=${parsed_row[haplotype_threshold_index]}
+    if (( variant_threshold_index >= 0 )); then
+      row_threshold_text=${parsed_row[variant_threshold_index]}
     fi
     parse_threshold_list "$row_threshold_text" row_thresholds
     thresholds_summary=$(IFS='-'; printf '%s' "${row_thresholds[*]}")
@@ -445,10 +475,10 @@ main() {
       IFS=$'\t' read -r -a metrics_fields <<< "$metrics_line"
       (( ${#metrics_fields[@]} == 9 )) || die "Unexpected VariantConcordance output for row \"$row_name\" at threshold $threshold: $metrics_line"
 
-      parsed_row[${column_index[source_haplotypes_$threshold]}]=${metrics_fields[1]}
-      parsed_row[${column_index[groundtruth_haplotypes_$threshold]}]=${metrics_fields[2]}
-      parsed_row[${column_index[intersection_haplotypes_$threshold]}]=${metrics_fields[3]}
-      parsed_row[${column_index[union_haplotypes_$threshold]}]=${metrics_fields[4]}
+      parsed_row[${column_index[source_variants_$threshold]}]=${metrics_fields[1]}
+      parsed_row[${column_index[groundtruth_variants_$threshold]}]=${metrics_fields[2]}
+      parsed_row[${column_index[intersection_variants_$threshold]}]=${metrics_fields[3]}
+      parsed_row[${column_index[union_variants_$threshold]}]=${metrics_fields[4]}
       parsed_row[${column_index[exact_overlap_mass_$threshold]}]=${metrics_fields[5]}
       parsed_row[${column_index[weighted_jaccard_$threshold]}]=${metrics_fields[6]}
       parsed_row[${column_index[jensen_shannon_similarity_$threshold]}]=${metrics_fields[7]}
