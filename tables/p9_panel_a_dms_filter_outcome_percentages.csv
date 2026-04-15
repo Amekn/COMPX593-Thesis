@@ -1,0 +1,12 @@
+display_name,family,variant,post_alignment_filter_reads,dms_pass_pct,failed_indel_pct,failed_coverage_pct,failed_dual_site_pct,failed_off_library_pct,total_pct
+Alpha,Alpha,base,653767,38.727,44.784,9.263,4.455,2.77,100.0
+AlphaQCH,Alpha,QCH,543787,43.615,41.59,8.09,5.244,1.461,100.0
+AlphaQCL,Alpha,QCL,632202,37.039,49.293,7.302,4.803,1.563,100.0
+Gamma,Gamma,base,614020,28.854,59.768,5.841,4.2,1.337,100.0
+GammaQCH,Gamma,QCH,567302,29.944,59.755,5.209,4.073,1.018,100.0
+GammaQCL,Gamma,QCL,582403,28.513,60.504,5.594,3.925,1.464,100.0
+Beta,Beta,base,601209,27.381,61.341,5.765,4.062,1.45,100.0
+BetaQCH,Beta,QCH,484833,24.522,65.885,4.92,3.383,1.289,100.0
+BetaQCL,Beta,QCL,477232,22.238,66.656,5.909,3.939,1.257,100.0
+sup,sup,sup,457205,14.328,77.906,2.68,4.767,0.319,100.0
+UDP0057,UDP0057,reference,1694634,41.521,0.254,6.907,46.468,4.85,100.0

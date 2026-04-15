@@ -1,0 +1,46 @@
+# macOS / OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+
+# CMake out-of-source build
+build/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.python-version
+.venv/
+venv/
+
+# Notebook working directory — large sequencing inputs, intermediate
+# outputs, per-model test artefacts, fine-tuned model weights, and
+# derived cache files are NOT tracked in git.
+src/ipynb/plot/
+
+# Sequencing & ML artefacts (belt-and-braces if staged elsewhere)
+*.pod5
+*.bam
+*.sam
+*.cram
+*.fq
+*.fastq
+*.fq.gz
+*.fastq.gz
+*.npy
+*.npz
+*.pt
+*.pth
+*.onnx
