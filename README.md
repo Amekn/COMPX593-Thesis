@@ -1,8 +1,7 @@
 # COMPX593 Thesis Toolkit
 
 Source code, summary tables, figures, and reference inputs used for the
-COMPX593 Master's thesis *"Evaluating DMS-aware nanopore polishing against
-short-read ground truth for antibody library characterisation"* (University
+COMPX593 Master's thesis *"Fine-Tuning Oxford Nanopore Basecalling Models to Enable High-Fidelity Single-Read Variant Calling in Antibody Libraries"* (University
 of Waikato, 2026).
 
 The repository bundles:
