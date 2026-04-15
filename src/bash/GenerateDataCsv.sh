@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# GenerateDataCsv.sh -- builds tables/data.csv, the thesis' per-dataset QC
+# table. For each dataset name listed in <names_file>, walks the full
+# basecall -> length-filter -> quality-filter -> alignment-filter ladder and
+# emits fifteen metrics per stage (read count, base count, min/max/median/
+# mean/N50 length, GC content, and Q5/Q7/Q10/Q15/Q20/Q30/Q40 base counts)
+# plus six primary-alignment metrics (I/D/mismatches, bases_mapped, and two
+# error rates). Resumable: rows already complete in the existing CSV are
+# skipped; intermediate FASTQs/BAMs are reused when fresh (controlled by
+# --force). Dependencies: awk, fastplong, mktemp, minimap2, python3,
+# samtools, and optionally dorado for POD5/raw inputs.
+#
+# The mega-header below encodes the exact column order so the writer can
+# `printf '%s,...'` without having to list 67 field names inline. Schema is
+# enforced on resume by comparing the first line of any existing output CSV.
 readonly CSV_HEADER='name,pre_length_filter_reads,pre_length_filter_bases,pre_length_filter_minimum_length,pre_length_filter_maximum_length,pre_length_filter_median_length,pre_length_filter_mean_length,pre_length_filter_n50_length,pre_length_filter_gc_content,pre_length_filter_q5_bases,pre_length_filter_q7_bases,pre_length_filter_q10_bases,pre_length_filter_q15_bases,pre_length_filter_q20_bases,pre_length_filter_q30_bases,pre_length_filter_q40_bases,post_length_filter_reads,post_length_filter_bases,post_length_filter_minimum_length,post_length_filter_maximum_length,post_length_filter_median_length,post_length_filter_mean_length,post_length_filter_n50_length,post_length_filter_gc_content,post_length_filter_q5_bases,post_length_filter_q7_bases,post_length_filter_q10_bases,post_length_filter_q15_bases,post_length_filter_q20_bases,post_length_filter_q30_bases,post_length_filter_q40_bases,post_quality_filter_reads,post_quality_filter_bases,post_quality_filter_minimum_length,post_quality_filter_maximum_length,post_quality_filter_median_length,post_quality_filter_mean_length,post_quality_filter_n50_length,post_quality_filter_gc_content,post_quality_filter_q5_bases,post_quality_filter_q7_bases,post_quality_filter_q10_bases,post_quality_filter_q15_bases,post_quality_filter_q20_bases,post_quality_filter_q30_bases,post_quality_filter_q40_bases,post_alignment_filter_reads,post_alignment_filter_bases,post_alignment_filter_minimum_length,post_alignment_filter_maximum_length,post_alignment_filter_median_length,post_alignment_filter_mean_length,post_alignment_filter_n50_length,post_alignment_filter_gc_content,post_alignment_filter_q5_bases,post_alignment_filter_q7_bases,post_alignment_filter_q10_bases,post_alignment_filter_q15_bases,post_alignment_filter_q20_bases,post_alignment_filter_q30_bases,post_alignment_filter_q40_bases,inserted_bases,deleted_bases,mismatches,bases_mapped,error_rate,overall_error_rate'
 
 usage() {
@@ -34,37 +48,47 @@ Options:
 EOF
 }
 
+# Print to stderr and exit 1.
 die() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
 }
 
+# Timestamped progress line to stderr (stdout is reserved for CSV writes).
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
 }
 
+# Guard: $1 must resolve to an executable on PATH.
 require_command() {
   local command_name=$1
   command -v "$command_name" >/dev/null 2>&1 || die "Required command not found: $command_name"
 }
 
+# Guard: $1 must be an existing regular file (label $2 for error text).
 require_file() {
   local path=$1
   local label=${2:-File}
   [[ -f "$path" ]] || die "$label does not exist: $path"
 }
 
+# Guard: $1 must be an existing directory (label $2 for error text).
 require_directory() {
   local path=$1
   local label=${2:-Directory}
   [[ -d "$path" ]] || die "$label does not exist: $path"
 }
 
+# Strip a trailing CR from a value so CSV/text inputs are portable between
+# Windows and Unix line endings.
 trim_cr() {
   local value=$1
   printf '%s' "${value%$'\r'}"
 }
 
+# Strip the extension chain from a dataset filename to derive a stable
+# intermediate-file stem. Handles double-extension gzipped FASTQs plus
+# common nanopore-pipeline extensions.
 dataset_stem_from_name() {
   local dataset_name=$1
   local stem=${dataset_name##*/}
@@ -77,6 +101,9 @@ dataset_stem_from_name() {
   printf '%s\n' "$stem"
 }
 
+# Best-effort auto-discovery of the Fc reference when --reference is not
+# supplied. Checks the project-convention filenames at the source root,
+# then falls back to a one-level-deep find. Returns 1 if nothing matches.
 default_reference_path() {
   local source_dir=$1
   local candidate
@@ -96,6 +123,10 @@ default_reference_path() {
   printf '%s\n' "$found_reference"
 }
 
+# Yield one dataset name per line to stdout. If the first line is the CSV
+# "name" header (with or without trailing columns), treat the file as a CSV
+# and extract column 1; otherwise read it as a plain newline-delimited
+# list. Either way, blank rows are skipped and CRs are trimmed.
 extract_dataset_names() {
   local names_file=$1
   local first_line
@@ -126,6 +157,9 @@ extract_dataset_names() {
   fi
 }
 
+# Locate the dataset on disk: direct path, then <source_dir>/<name>, then
+# a recursive `find` for any file or directory named exactly <name>.
+# Returns non-zero if nothing matches, dies on ambiguity.
 resolve_source_path() {
   local source_dir=$1
   local dataset_name=$2
@@ -158,6 +192,11 @@ resolve_source_path() {
   exit 1
 }
 
+# Emit a 15-field CSV slice for one FASTQ (plain or .gz): reads, bases,
+# min/max/median/mean/N50 length, GC content, and Q>=N base counts for
+# N in {5,7,10,15,20,30,40}. Heavy lifting is inline Python (requires
+# python3) rather than a chain of awk+samtools so the Q-binning and N50
+# stay readable. $1: FASTQ path. Stdout: one comma-separated line.
 compute_fastq_metrics_csv() {
   local fastq_path=$1
 
@@ -313,12 +352,17 @@ print(",".join(str(value) for value in values))
 PY
 }
 
+# Extract a single SN-section value from `samtools stats`. See the CalcStats
+# helper for the same pattern: $1 name matches "SN", $2 is the key.
 extract_samtools_sn_metric() {
   local stats_path=$1
   local metric_name=$2
   awk -F '\t' -v key="$metric_name" '$1 == "SN" && $2 == key { print $3; exit }' "$stats_path"
 }
 
+# Walk CIGAR strings on primary alignments only (0x904 = unmapped | secondary
+# | supplementary) and sum I/D bases. Unlike CalcStats.sh's helper this one
+# prints "<ins>,<del>" so the caller can split on a comma.
 count_primary_bam_indel_bases() {
   local bam_path=$1
 
@@ -344,6 +388,11 @@ count_primary_bam_indel_bases() {
       '
 }
 
+# Emit the six alignment-quality fields for one BAM: inserted_bases,
+# deleted_bases, mismatches, bases_mapped, error_rate (mismatch/base) and
+# overall_error_rate (mismatch+indel)/base. $1: primary-only sorted BAM.
+# Stdout: one comma-separated line. Uses a temp file for `samtools stats`
+# output that is cleaned up inline.
 compute_alignment_metrics_csv() {
   local bam_path=$1
   local temporary_stats
@@ -397,6 +446,10 @@ compute_alignment_metrics_csv() {
     "$overall_error_rate"
 }
 
+# Full structural check of a FASTQ (plain or .gz): that every record has
+# four lines, headers start with '@', separators start with '+', and
+# sequence length equals quality length. Non-zero exit means the caller
+# must regenerate the file.
 validate_fastq_file() {
   local fastq_path=$1
 
@@ -444,21 +497,28 @@ with open_fastq(path) as handle:
 PY
 }
 
+# Sidecar marker path; presence signals "already validated this FASTQ, no
+# need to rescan". Enables cheap resume on re-run.
 fastq_marker_path() {
   local fastq_path=$1
   printf '%s.ok\n' "$fastq_path"
 }
 
+# Record that $1 is a structurally valid FASTQ. Writes an empty .ok sidecar.
 mark_fastq_valid() {
   local fastq_path=$1
   : >"$(fastq_marker_path "$fastq_path")"
 }
 
+# Remove both the FASTQ and its validity marker; used before regenerating.
 clear_fastq_state() {
   local fastq_path=$1
   rm -f -- "$fastq_path" "$(fastq_marker_path "$fastq_path")"
 }
 
+# Skip regeneration if $1 exists, --force is off, and either the .ok marker
+# is present or a fresh structural check passes. Returns 0 if the existing
+# FASTQ can be reused, 1 if the caller must rebuild it.
 reuse_fastq_if_valid() {
   local fastq_path=$1
   local force=$2
@@ -478,6 +538,10 @@ reuse_fastq_if_valid() {
   return 1
 }
 
+# Like reuse_fastq_if_valid, but additionally verifies the output is newer
+# than its input ($1) and than every required sibling artifact ($@). If
+# any dependency is newer than the output or missing, returns 1 so the
+# stage rebuilds. $1 input, $2 output, $3 force, $4 label, $@ artifacts.
 reuse_stage_fastq_if_valid() {
   local input_fastq=$1
   local output_fastq=$2
@@ -507,6 +571,9 @@ reuse_stage_fastq_if_valid() {
   reuse_fastq_if_valid "$output_fastq" "$force" "$label"
 }
 
+# Ensure the output CSV starts with the canonical schema header. If the
+# file already exists and its header differs we die rather than clobber
+# or silently mix schemas (resume would produce garbled rows).
 prepare_output_csv_for_resume() {
   local output_csv=$1
   local existing_header
@@ -520,6 +587,10 @@ prepare_output_csv_for_resume() {
   fi
 }
 
+# Emit one dataset name per line for every row of the output CSV whose
+# every column is populated (i.e. the row was fully written in a prior
+# run). Rows with trailing-empty cells are treated as incomplete and will
+# be redone.
 extract_completed_output_names() {
   local output_csv=$1
 
@@ -552,6 +623,10 @@ extract_completed_output_names() {
   ' "$output_csv"
 }
 
+# Invoke dorado to basecall a POD5 file or directory to FASTQ. Retries
+# once on failure; accepts dorado exit!=0 if the resulting FASTQ still
+# validates (dorado occasionally returns non-zero on clean shutdown).
+# $1 POD5 path, $2 output FASTQ, $3 kit name, $4 model, $5 force flag.
 run_basecalling_if_needed() {
   local source_path=$1
   local output_fastq=$2
@@ -566,6 +641,9 @@ run_basecalling_if_needed() {
   require_command dorado
   mkdir -p "$(dirname "$output_fastq")"
 
+  # --emit-fastq bypasses BAM emission (we only need sequences + quals here);
+  # --trim all matches the DMSPolishing.sh convention so downstream fastplong
+  # can leave adapter trimming disabled.
   local dorado_args=(
     basecaller
     --emit-fastq
@@ -604,6 +682,8 @@ run_basecalling_if_needed() {
   return 1
 }
 
+# Convert a pre-basecalled BAM to FASTQ via `samtools fastq`. Same retry
+# + validate pattern as the dorado wrapper above.
 run_bam_to_fastq_if_needed() {
   local source_bam=$1
   local output_fastq=$2
@@ -636,6 +716,10 @@ run_bam_to_fastq_if_needed() {
   return 1
 }
 
+# Stage 1 of the QC ladder: length-only gate via fastplong with adapter and
+# quality filtering both disabled so the knob under test is read length.
+# Emits fastplong's HTML+JSON reports next to the filtered FASTQ. Args
+# mirror the positional order in the caller in process_dataset().
 run_length_filter_if_needed() {
   local input_fastq=$1
   local output_fastq=$2
@@ -693,6 +777,9 @@ run_length_filter_if_needed() {
   return 1
 }
 
+# Stage 2 of the QC ladder: mean-quality gate via fastplong with adapter
+# and length filtering both disabled. Reads the length-filtered FASTQ and
+# applies only --mean_qual so the knob under test is Q.
 run_quality_filter_if_needed() {
   local input_fastq=$1
   local output_fastq=$2
@@ -748,6 +835,13 @@ run_quality_filter_if_needed() {
   return 1
 }
 
+# Stage 3 of the QC ladder: map with minimap2 (map-ont preset), keep only
+# primary alignments (0x904 mask drops unmapped/secondary/supplementary),
+# and project the kept reads back into a FASTQ whose per-read stats can be
+# directly compared against the pre-alignment stats. Empty-input fast-path
+# writes an empty aligned FASTQ so downstream stages do not explode on 0
+# records. A second fastplong pass (/dev/null output) is used purely to
+# produce HTML/JSON reports for the post-alignment FASTQ.
 run_alignment_if_needed() {
   local input_fastq=$1
   local reference_path=$2
@@ -789,6 +883,7 @@ run_alignment_if_needed() {
     rm -f -- "$aligned_bam" "$primary_bam" "$report_html" "$report_json"
     log "Aligning $input_fastq -> $aligned_fastq (attempt $attempt)"
 
+    # minimap2 | samtools view -u => one uncompressed BAM of every alignment.
     if minimap2 -t "$threads" -ax map-ont "$reference_path" "$input_fastq" \
       | samtools view -@ "$threads" -u -o "$aligned_bam" -
     then
@@ -799,6 +894,8 @@ run_alignment_if_needed() {
       continue
     fi
 
+    # Restrict to primaries (0x904 mask), name-sort so later consumers get
+    # one record per read in a deterministic order.
     if samtools view -@ "$threads" -F 0x904 -u "$aligned_bam" \
       | samtools sort -@ "$threads" -n -o "$primary_bam" -
     then
@@ -825,6 +922,9 @@ run_alignment_if_needed() {
     return 1
   fi
 
+  # Report-only pass: fastplong with every filter disabled and --out
+  # discarded, used purely to get HTML/JSON summaries that match the
+  # shape of the earlier stage reports.
   if ! fastplong \
     --disable_adapter_trimming \
     --disable_quality_filtering \
@@ -842,6 +942,10 @@ run_alignment_if_needed() {
   return 0
 }
 
+# Run the full ladder for one dataset and append the completed row to the
+# output CSV. Dispatch on file extension to pick between basecalling (POD5
+# / directory), BAM-to-FASTQ, and passthrough (FASTQ). Failures return 1
+# so main() can record the dataset in the failures file.
 process_dataset() {
   local source_dir=$1
   local dataset_name=$2
@@ -955,6 +1059,10 @@ process_dataset() {
 }
 
 main() {
+  # Defaults match the Fc-amplicon thesis workload:
+  #   kit=SQK-NBD114-24, dorado model sup@v5.2.0 (stock 400bps super-accuracy),
+  #   length 600-800 bp (Fc amplicon ~700 bp), mean Q>=15 quality gate,
+  #   16 threads to balance aligner and caller on the workstation.
   local source_dir=
   local names_file=
   local output_csv=
@@ -1074,12 +1182,15 @@ main() {
 
   prepare_output_csv_for_resume "$output_csv"
 
+  # Build a set of already-complete dataset names so we skip them on resume.
   declare -A completed_dataset_names=()
   local existing_dataset_name
   while IFS= read -r existing_dataset_name; do
     completed_dataset_names["$existing_dataset_name"]=1
   done < <(extract_completed_output_names "$output_csv")
 
+  # Sidecar file receiving one line per failed dataset; truncated on every
+  # run so it reflects only the most recent invocation.
   local failed_datasets_file="${output_csv}.failed.txt"
   : >"$failed_datasets_file"
 

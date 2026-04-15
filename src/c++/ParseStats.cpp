@@ -1,3 +1,11 @@
+// ParseStats.cpp
+// Produces executable: ParseStats
+// Usage: ParseStats [stats_file]   (stdin if omitted)
+//
+// Pipeline role: pretty-print the 'SN' (summary-numbers) section of a
+// samtools stats output as a three-column table (Metric, Value, Comment).
+// Used to embed alignment summaries in the thesis reports without pulling
+// in awk/cut boilerplate in every analysis script.
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -6,12 +14,14 @@
 
 using namespace std;
 
+// Single parsed 'SN' row; comment is optional and has any leading '# ' trimmed.
 struct Row {
     string metric;
     string value;
     string comment;
 };
 
+// Print CLI contract to stderr when args are invalid.
 static void usage(const char* prog) {
     cerr << "Usage: " << prog << " [stats_file]\n\n"
          <<
@@ -22,10 +32,13 @@ Description:
 )";
 }
 
+// Read the stream and return only the 'SN' summary rows, split on tabs.
+// Skips every other section emitted by samtools stats (FFQ, GCF, IS, ...).
 static vector<Row> parse_rows(istream& in) {
     vector<Row> rows;
     string line;
     while (getline(in, line)) {
+        // Keep only lines that start with the SN section prefix.
         if (line.rfind("SN\t", 0) != 0) continue;
 
         vector<string> fields;
@@ -45,6 +58,9 @@ static vector<Row> parse_rows(istream& in) {
         Row row;
         row.metric = fields[1];
         row.value = fields[2];
+        // An optional 4th field holds samtools' free-text comment, which
+        // usually begins with '#'; strip the '#' and any leading spaces
+        // so the comment column in the output is plain English.
         if (fields.size() > 3) {
             row.comment = fields[3];
             if (!row.comment.empty() && row.comment[0] == '#') {
@@ -90,6 +106,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Compute per-column widths so the output lines up regardless of the
+    // longest metric name or value in the current stats file.
     size_t metric_w = string("Metric").size();
     size_t value_w = string("Value").size();
     size_t comment_w = string("Comment").size();

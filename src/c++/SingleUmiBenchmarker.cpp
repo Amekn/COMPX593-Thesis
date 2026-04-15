@@ -63,6 +63,8 @@ Precision/Recall (nucleotide-level, alignment-based):
 
 using namespace std;
 
+// One full FASTQ record held as four plain strings. `plus` is retained only
+// for validation (checking the leading '+'); it is never used downstream.
 struct FastqRecord {
     string header;
     string seq;
@@ -70,6 +72,9 @@ struct FastqRecord {
     string qual;
 };
 
+// Read one 4-line FASTQ record into `r`. Returns false on clean EOF at the
+// header line; throws on truncation or any line-level format violation
+// (non-'@' header, non-'+' plus line, seq/qual length mismatch).
 static bool read_fastq_record(istream& in, FastqRecord& r) {
     r = {};
     if (!std::getline(in, r.header)) return false;
@@ -87,12 +92,18 @@ static bool read_fastq_record(istream& in, FastqRecord& r) {
     return true;
 }
 
+// ASCII whitespace check. std::isspace is avoided because it takes an int in
+// [0, UCHAR_MAX] and invokes locale; this stays strictly byte-oriented.
 static inline bool is_space(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
 // Extract UMI after "UMI_" up to whitespace/end.
 // Returns empty string if not found.
+//
+// Accepts either "UMI_" or "umi_" and is intentionally tolerant about the
+// surrounding delimiters: the single-UMI variant of the pipeline lets callers
+// pass headers straight from upstream tools that vary in capitalisation.
 static string extract_umi_key(const string& header) {
     // header includes leading '@'
     // We search both "UMI_" and "umi_" just in case humans got creative.
@@ -107,11 +118,18 @@ static string extract_umi_key(const string& header) {
     return header.substr(pos, end - pos);
 }
 
+// One ground-truth reference record indexed in the UMI multimap. `qual` runs
+// in parallel with `seq`; a '#' at position i disables match/sub/del scoring
+// for that reference position (see banded_global_align).
 struct RefRecord {
     string seq;
     string qual; // same length as seq
 };
 
+// Counts produced by a single banded NW traceback. `score` is a signed scoring
+// metric (affine-free: +2/-1/-2) used only to pick the best candidate when a
+// UMI key maps to multiple GT records; min()/4 is a cheap INF sentinel that
+// leaves headroom for addition without overflow.
 struct AlignmentCounts {
     int score = std::numeric_limits<int>::min()/4;
     uint64_t matches = 0;
@@ -121,6 +139,11 @@ struct AlignmentCounts {
     uint64_t total = 0; // matches+subs+ins+del (with match/sub/del ignoring ref '#')
 };
 
+// Banded global (Needleman-Wunsch) alignment of `query` against `ref` using
+// `refQual` as a per-ref-position mask. Fills a banded DP table of half-width
+// `band_half_width` and performs traceback to count matches/subs/ins/del.
+// Retries once with a full-matrix band if the DP endpoint is unreachable.
+//
 // Scoring:
 //   match: +2
 //   mismatch: -1
@@ -136,6 +159,10 @@ static AlignmentCounts banded_global_align(
     const string& refQual,
     int band_half_width
 ) {
+    // Scoring schema: match rewards +2, mismatch -1, gap -2. Chosen so that
+    // a short insertion (-2) costs less than converting a match (+2) into a
+    // mismatch (-1) plus an insertion (-2 = -3 total), preventing false
+    // mismatch calls on borderline columns when the nanopore read is drifting.
     const int MATCH = 2;
     const int MISMATCH = -1;
     const int GAP = -2;
@@ -146,7 +173,8 @@ static AlignmentCounts banded_global_align(
         throw runtime_error("Internal error: ref qual length != ref length");
 
     // Make sure band is at least large enough to connect (m,n) from (0,0)
-    // Otherwise dp[m][n] may be unreachable.
+    // Otherwise dp[m][n] may be unreachable. The +2 slack avoids off-by-one
+    // band failures when |m-n| exactly matches the band half-width.
     band_half_width = max(band_half_width, abs(m - n) + 2);
 
     // startJ/endJ for each row i
@@ -278,6 +306,9 @@ static AlignmentCounts banded_global_align(
     }
 
     // If dp[m][n] isn't in band or unreachable, widen band and retry (one retry).
+    // `max(m,n)` makes the band wide enough to cover the entire DP matrix,
+    // which is equivalent to running unbanded NW; recursion depth is bounded
+    // at 1 because that call necessarily reaches dp[m][n].
     if (!(n >= startJ[m] && n <= endJ[m])) {
         return banded_global_align(query, ref, refQual, max(m, n));
     }
@@ -326,6 +357,7 @@ static AlignmentCounts banded_global_align(
     return out;
 }
 
+// Whole-file accumulator across every read processed for one test FASTQ.
 struct Totals {
     uint64_t reads_compared = 0;
     uint64_t total = 0;
@@ -335,6 +367,9 @@ struct Totals {
     uint64_t subs = 0;
 };
 
+// Fold the best-alignment counts for one read into the running totals.
+// `reads_compared` is intentionally incremented by the caller, not here, so
+// totals can be left untouched on reads with no GT match.
 static void add_counts(Totals& t, const AlignmentCounts& a) {
     t.total   += a.total;
     t.matches += a.matches;
@@ -343,6 +378,7 @@ static void add_counts(Totals& t, const AlignmentCounts& a) {
     t.subs    += a.subs;
 }
 
+// Division that returns 0.0 on a zero denominator, avoiding NaN/Inf in the TSV.
 static double safe_div(double num, double den) {
     return (den == 0.0) ? 0.0 : (num / den);
 }
@@ -376,7 +412,10 @@ int main(int argc, char** argv) {
     const string ground_path = positional[0];
     vector<string> test_paths(positional.begin() + 1, positional.end());
 
-    // Load ground truth into unordered_multimap
+    // Load ground truth into unordered_multimap so duplicate single-UMI keys
+    // can all coexist. At evaluation time we align against every GT record
+    // sharing the test read's UMI and keep the highest-scoring alignment.
+    // Reserve 1M buckets to front-load allocation on typical thesis datasets.
     unordered_multimap<string, RefRecord> gt;
     gt.reserve(1 << 20);
 
@@ -457,7 +496,10 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            // Align to one or multiple GT candidates and pick best score
+            // Align to one or multiple GT candidates and pick best score.
+            // The single-UMI scheme can yield >1 GT record per key when unrelated
+            // templates happen to share a short UMI; the highest-scoring
+            // alignment is taken as the intended match.
             AlignmentCounts best;
             bool have_best = false;
 
@@ -483,6 +525,10 @@ int main(int argc, char** argv) {
         double norm_i = safe_div((double)totals.ins, total);
         double norm_s = safe_div((double)totals.subs, total);
 
+        // "CIGAR bases" (matches + subs) matches minimap2's definition of
+        // bases aligned under M/=/X operations, and the mismatch rate in that
+        // space is directly comparable to the mm2 accuracy figure reported on
+        // the Dorado / Bonito basecaller model cards.
         double bases_mapped_cigar = (double)totals.matches + (double)totals.subs;
         double mm2_mismatch_rate  = safe_div((double)totals.subs, bases_mapped_cigar);
 

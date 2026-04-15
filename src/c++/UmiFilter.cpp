@@ -1,3 +1,12 @@
+// UmiFilter.cpp
+// Produces executable: UmiFilter
+// Usage: UmiFilter <input.fastq> <output.fastq>
+//
+// Pipeline role: single-pass UMI dedup. Reads a FASTQ that already carries
+// ":UMI_<key>" headers, keeps the first record for each distinct UMI key,
+// drops duplicates and reads without a UMI tag, and prints a one-line
+// summary to stderr. Output preserves insertion order so downstream tools
+// see a stable deduplicated stream.
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -8,6 +17,7 @@
 
 namespace {
 
+// Print the CLI contract to stderr when argv count does not match.
 void PrintUsage(const char* program_name) {
     std::cerr
         << "Usage: " << program_name << " <input.fastq> <output.fastq>\n\n"
@@ -28,6 +38,9 @@ int main(int argc, char** argv) {
     const std::string input_fastq = argv[1];
     const std::string output_fastq = argv[2];
 
+    // Reserve ~4M buckets (1<<22): the IgA Fc library has ~150k CFU but
+    // a basecalled nanopore dataset is routinely several million reads, so
+    // pre-sizing avoids rehashing during the hot insertion loop.
     std::unordered_set<std::string> seen_umi_keys;
     seen_umi_keys.reserve(1U << 22);
 
@@ -44,6 +57,8 @@ int main(int argc, char** argv) {
         while (reader.Next(record)) {
             ++total_reads;
 
+            // Reads without a ':UMI_' tag are counted and dropped rather
+            // than propagated as untagged noise.
             std::string umi_key;
             try {
                 umi_key = ont::umi::ParseSingleKey(record.header);
@@ -52,6 +67,8 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            // First occurrence wins: later reads with the same UMI are
+            // counted as duplicates and suppressed from the output stream.
             const auto [_, inserted] = seen_umi_keys.insert(std::move(umi_key));
             if (inserted) {
                 writer.Write(record);

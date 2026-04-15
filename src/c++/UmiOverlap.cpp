@@ -1,3 +1,11 @@
+// UmiOverlap.cpp
+// Produces executable: UmiOverlap
+// Usage: UmiOverlap <fastq1> <fastq2>
+//
+// Pipeline role: compute unique-UMI-set overlap between two FASTQ files
+// annotated with ':UMI_<key>' tags. Used to gauge how much the nanopore
+// and MGI-derived UMI populations share after dedup, and to sanity-check
+// that UmiFilter output has the expected cardinality.
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -9,19 +17,25 @@
 
 namespace {
 
+// Print CLI contract to stderr when argv count does not match.
 void PrintUsage(const char* program_name) {
     std::cerr
         << "Usage: " << program_name << " <fastq1> <fastq2>\n\n"
         << "Report read counts and the overlap between the UMI key sets of two FASTQ files.\n";
 }
 
+// Per-file summary: total records plus the set of distinct UMI keys seen.
 struct FileSummary {
     std::uint64_t read_count = 0;
     std::unordered_set<std::string> umi_keys;
 };
 
+// Stream a FASTQ and collect distinct UMI keys plus the record count.
+// Throws std::runtime_error if the path cannot be opened.
 FileSummary LoadUmiKeys(const std::string& fastq_path) {
     FileSummary summary;
+    // ~4M buckets: matches the UmiFilter sizing so a deduplicated FASTQ
+    // can be consumed without rehashing on the expected-case library size.
     summary.umi_keys.reserve(1U << 22);
 
     std::ifstream input_stream(fastq_path);
@@ -38,6 +52,8 @@ FileSummary LoadUmiKeys(const std::string& fastq_path) {
     return summary;
 }
 
+// Count how many keys are present in both sets. Iterates the smaller set and
+// probes the larger, so cost is O(min(|a|,|b|)) average-case.
 std::uint64_t CountSetOverlap(
     const std::unordered_set<std::string>& left_keys,
     const std::unordered_set<std::string>& right_keys) {

@@ -52,11 +52,17 @@ Precision/Recall definition (nucleotide-level, alignment-based):
 
 using namespace std;
 
+// One ground-truth record indexed by dual UMI. Both strings are retained so
+// the '#' quality mask can downweight low-confidence Illumina positions.
 struct GTRead {
     string seq;
     string qual; // same length as seq (after padding/trimming)
 };
 
+// Nucleotide-level alignment tallies accumulated across every (read, GT) pair
+// for a single test FASTQ. Only `ref_qual != '#'` positions contribute to
+// match/sub/del counts; insertions always count because they do not consume
+// reference bases.
 struct Stats {
     uint64_t processed_reads = 0;
     uint64_t total_compared = 0;   // reference positions considered (qual != '#')
@@ -66,10 +72,14 @@ struct Stats {
     uint64_t substituted = 0;      // ref base != test base (both present)
 };
 
+// ASCII uppercasing via unsigned char promotion to avoid UB on signed char > 127.
 static inline char up(char c) {
     return static_cast<char>(toupper(static_cast<unsigned char>(c)));
 }
 
+// Read one 4-line FASTQ record from `in`. Throws on truncated or malformed
+// records (missing '+' line, mismatched seq/qual lengths, absent '@'). The
+// four string arguments are always reset at entry so callers do not have to.
 static bool read_fastq_record(istream& in, string& header, string& seq, string& plus, string& qual) {
     header.clear(); seq.clear(); plus.clear(); qual.clear();
     if (!std::getline(in, header)) return false;
@@ -86,6 +96,8 @@ static bool read_fastq_record(istream& in, string& header, string& seq, string& 
 }
 
 // Parse ":UMI_<FWD>_<REV>" from header (either with or without the leading '@').
+// Returns the canonical "<FWD>_<REV>" join used as the hash key. Throws if the
+// tag is missing or malformed. The tag is produced by UmiExtractor upstream.
 static string parse_dual_umi_key(const string& header_line) {
     const string& h = header_line;
     size_t pos = h.find(":UMI_");
@@ -120,6 +132,12 @@ static string parse_dual_umi_key(const string& header_line) {
 // with levenshtein costs: match 0, sub 1, ins 1, del 1
 // (i.e., editing distance)
 // Returns alignment-derived counts; ignores reference positions where ref_qual[i] == '#'.
+//
+// The '#' mask allows the pipeline to exclude Illumina bases flagged as
+// unreliable (assigned '#' in the ground-truth quality string) from the match
+// / substitution / deletion counts without changing the shape of the
+// alignment. Insertions always count because they do not consume a reference
+// position. On narrow-band failure the caller escalates to a full matrix.
 static void align_and_count(const string& ref, const string& ref_qual, const string& test, Stats& S) {
     // ref: ground truth sequence
     const int n = static_cast<int>(ref.size());
@@ -130,10 +148,15 @@ static void align_and_count(const string& ref, const string& ref_qual, const str
 
     const int max_len = max(n, m);
     // Default band: enough to allow typical indels but avoid full O(n*m) for every read.
+    // For the 687 bp Fc amplicon, band = max(50, |n-m|+50) absorbs the 5-10%
+    // nanopore indel drift without exploding memory. Capped at max_len so the
+    // band never exceeds the DP matrix itself.
     int band = max(50, abs(n - m) + 50);
     band = min(band, max_len);
 
-    // Banded DP Lambda Function
+    // Banded Needleman-Wunsch. Returns true if a complete traceback stays
+    // inside the band; returns false if the band was too tight so the caller
+    // can retry with a wider one. `S` is accumulated in place on success.
     auto run_banded = [&](int use_band) -> bool {
         const uint16_t INF = std::numeric_limits<uint16_t>::max() / 4;
 
@@ -257,6 +280,8 @@ static void align_and_count(const string& ref, const string& ref_qual, const str
     };
 
     // Try banded; if the band was too tight for some nasty read, fall back to full DP band.
+    // Widening to max_len degenerates to unbanded NW, which is guaranteed
+    // reachable. Failing that is a structural bug, not a data quirk.
     if (!run_banded(band)) {
         if(!run_banded(max_len)){
             throw runtime_error("Alignment failed even with full DP matrix.");
@@ -264,6 +289,10 @@ static void align_and_count(const string& ref, const string& ref_qual, const str
     }
 }
 
+// Load the ground-truth FASTQ into a hash keyed by dual UMI. Duplicate keys
+// keep the first occurrence (later PCR duplicates with the same UMI are
+// ignored). The reserve hint of ~3M buckets and 0.70 load factor is tuned for
+// the ~1.7M Illumina reads in the thesis dataset, avoiding rehashes.
 static unordered_map<string, GTRead> load_ground_truth(const string& path) {
     ifstream in(path);
     if (!in) throw runtime_error("Failed to open ground truth FASTQ: " + path);
@@ -285,6 +314,9 @@ static unordered_map<string, GTRead> load_ground_truth(const string& path) {
     return gt;
 }
 
+// Emit the TSV column header used by the Benchmarker pipeline. Kept as a
+// dedicated function so the column order is defined in exactly one place and
+// `report()` only has to keep the value order consistent.
 static void print_header() {
     cout
         << "test_fastq"
@@ -304,6 +336,10 @@ static void print_header() {
         << "\n";
 }
 
+// Convert accumulated alignment tallies into normalized rates and
+// precision/recall/F1, then emit one TSV row. Empty numerators/denominators
+// degrade to 0 rather than producing NaN, keeping the output trivially
+// parseable by downstream R/Python analysis scripts.
 static void report(const string& test_path, const Stats& S) {
     double total = (S.total_compared == 0) ? 0.0 : static_cast<double>(S.total_compared);
 

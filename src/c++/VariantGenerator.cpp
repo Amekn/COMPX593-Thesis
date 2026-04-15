@@ -1,3 +1,16 @@
+// VariantGenerator: produces synthetic FASTA amplicons used to sanity-check
+// and stress-test the downstream basecalling / alignment / DMS-filtering
+// pipeline. A reference sequence is perturbed at two independent per-base
+// rates (inside vs. outside user-defined mutation regions) and optionally
+// extended or trimmed at both ends by a random length delta. With --revcomp
+// a matching reverse-complement variant is emitted alongside each forward
+// variant so the alignment stage can be tested against either orientation.
+//
+// Usage: VariantGenerator <var_prob> <fw_prob> <max_len_flux> <n>
+//                         <region_file> <ref.fasta> <out.fasta>
+//                         [--revcomp|-r]
+// Probabilities are integer percentages in [0, 100]. region_file is a CSV
+// list of `start,end` intervals (end exclusive) flagging the "variable" mask.
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -10,6 +23,7 @@
 
 using namespace std;
 
+// Half-open reference interval: [start, end).
 struct Region {
     size_t start;   // inclusive
     size_t end;     // exclusive (must satisfy start < end)
@@ -18,6 +32,8 @@ struct Region {
 // ──────────────────────────────────────────────────────────────────────────────
 // Utility helpers
 // ──────────────────────────────────────────────────────────────────────────────
+// Draw a uniform random DNA base different from `exclude` (case-insensitive).
+// Rejection sampling; expected number of iterations is ~4/3 per call.
 static char random_base(char exclude, mt19937 &rng) {
     static const char bases[] = {'A', 'C', 'G', 'T'};
     uniform_int_distribution<int> dist(0, 3);
@@ -28,6 +44,9 @@ static char random_base(char exclude, mt19937 &rng) {
     return b;
 }
 
+// Emit an `n`-long uniform random DNA string (used to pad reads on either end
+// when `delta_start`/`delta_end` are negative, i.e. the variant is longer
+// than the reference).
 static string random_bases(size_t n, mt19937 &rng) {
     static const char bases[] = {'A', 'C', 'G', 'T'};
     uniform_int_distribution<int> dist(0, 3);
@@ -38,6 +57,7 @@ static string random_bases(size_t n, mt19937 &rng) {
     return s;
 }
 
+// Watson-Crick complement of a single base; anything non-ACGT collapses to 'N'.
 static inline char comp(char b) {
     switch (toupper(b)) {
         case 'A': return 'T';
@@ -48,6 +68,8 @@ static inline char comp(char b) {
     }
 }
 
+// Reverse-complement a DNA string by walking the input backwards and
+// complementing each base. Keeps output length == input length.
 static string reverse_complement(const string &seq) {
     string rc;
     rc.reserve(seq.size());
@@ -59,6 +81,9 @@ static string reverse_complement(const string &seq) {
 // ──────────────────────────────────────────────────────────────────────────────
 // FASTA & Region helpers
 // ──────────────────────────────────────────────────────────────────────────────
+// Read a single-record FASTA and return the concatenated sequence. Writes the
+// contig name (the portion of the header after '>') into `sequence_name`.
+// Throws on an unreadable file or an empty/nameless record.
 static string read_fasta(const string &path, string &sequence_name) {
     ifstream in(path);
     if (!in)
@@ -79,6 +104,10 @@ static string read_fasta(const string &path, string &sequence_name) {
     return seq;
 }
 
+// Parse a CSV-per-line "start,end" region file and flatten it into a vector
+// of individual 0-based reference positions marked as variable. `end` is
+// exclusive so [40,75) yields 35 positions. Throws on any interval that
+// violates start<end or overruns the reference.
 static vector<size_t> read_regions(const string &path, size_t ref_len) {
     ifstream in(path);
     if (!in)
@@ -164,7 +193,8 @@ int main(int argc, char *argv[]) {
     string ref_seq = read_fasta(ref_fasta, ref_name);
     const size_t ref_len = ref_seq.size();
 
-    // Mutable positions mask
+    // Flatten region intervals into a per-base boolean mask for O(1) lookup
+    // inside the hot mutation loop.
     vector<size_t> allowed = read_regions(region_file, ref_len);
     if (allowed.empty()) {
         cerr << "No regions specified\n";
@@ -173,16 +203,23 @@ int main(int argc, char *argv[]) {
     vector<char> is_variable(ref_len, 0);
     for (size_t p : allowed) is_variable[p] = 1;
 
-    // RNG helpers
+    // RNG helpers. `prob_dist` draws in [1,100] so that a probability threshold
+    // of p means roll<=p, exactly matching the "p percent of the time" reading.
+    // `len_flunc_dist` is signed so positive deltas trim and negative deltas
+    // extend the ends.
     mt19937 rng(random_device{}());
     uniform_int_distribution<int> prob_dist(1, 100);  // inclusive
     uniform_int_distribution<int> len_flunc_dist(-static_cast<int>(max_len_flunc), static_cast<int>(max_len_flunc));
 
-    // Convenience lambda: generate one variant (forward or RC)
+    // Build one variant by (1) point-mutating each base using the zone-specific
+    // rate, (2) independently trimming or padding each end by a signed delta,
+    // (3) optionally reverse-complementing the whole thing.
     auto generate_variant = [&](bool make_revcomp) -> string {
         string variant = ref_seq;
 
-        // 1. Point mutations
+        // 1. Point mutations: inside-zone positions use `var_prob`, outside use
+        //    the lower `fw_prob`. random_base guarantees a true substitution
+        //    (new base != old base).
         for (size_t p = 0; p < variant.size(); ++p) {
             int roll = prob_dist(rng);
             if ((is_variable[p] && roll <= static_cast<int>(var_prob)) ||
@@ -191,7 +228,10 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // 2. Length fluctuations at both ends
+        // 2. Length fluctuations at both ends. Positive delta -> trim that
+        //    many bases from the corresponding end; negative delta -> pad with
+        //    random bases. trim_end is clamped against the remaining length
+        //    after start-trim to avoid underflow on the substr computation.
         int delta_start = len_flunc_dist(rng);
         int delta_end   = len_flunc_dist(rng);
         size_t trim_start = delta_start > 0 ? min<size_t>(delta_start, variant.size()) : 0;
@@ -204,7 +244,7 @@ int main(int argc, char *argv[]) {
         if (delta_end < 0)
             core += random_bases(static_cast<size_t>(-delta_end), rng);
 
-        // 3. Reverse‑complement if requested for this specific variant
+        // 3. Reverse-complement if requested for this specific variant.
         return make_revcomp ? reverse_complement(core) : core;
     };
 
@@ -217,6 +257,9 @@ int main(int argc, char *argv[]) {
     // ------------------------------------------------------------------
     // Variant generation loop
     // ------------------------------------------------------------------
+    // With --revcomp on, pair every forward variant with an independent RC
+    // variant (not the RC of the same draw); this doubles effective coverage
+    // and exercises both strand orientations through the alignment stage.
     if(revcomp_flag){
         num_variants *= 2;  // Double the number of variants if reverse-complement is requested
         for(size_t id = 0; id < num_variants; id+=2){
@@ -225,7 +268,7 @@ int main(int argc, char *argv[]) {
             out << '>' << ref_name << "_FR_" << (id + 1) << '\n';
             out << fwd_seq << '\n';
 
-            // Reverse-complement variant
+            // Reverse-complement variant (independent draw, not RC of fwd_seq)
             string rc_seq = generate_variant(true);
             out << '>' << ref_name << "_RC_" << (id + 2) << '\n';
             out << rc_seq << '\n';

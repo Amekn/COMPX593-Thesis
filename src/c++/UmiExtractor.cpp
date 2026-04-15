@@ -1,3 +1,16 @@
+// UmiExtractor: dual-UMI extraction stage of the thesis pipeline.
+//
+// Produces the `UmiExtractor` executable. For each nanopore FASTQ record the
+// tool locates the 1st-round PCR primer pair (forward + reverse), reads off the
+// degenerate (IUPAC ambiguous) UMI bases embedded in each primer, appends a
+// ":UMI_<fwd>_<rev>" tag to the header, and trims the read down to the insert
+// between the two UMI stretches. Reads are tried first in their original
+// orientation, then reverse-complemented; orientation-specific UMIs are
+// canonicalised back into the forward frame so downstream tools (Benchmarker,
+// DualSiteDMSFilter, VariantConcordance) always see one key per template.
+//
+// Usage: UmiExtractor <input.fastq> <output.fastq> <fwd_primer> <rev_primer>
+//                    <max_mismatch>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -8,6 +21,10 @@
 
 namespace {
 
+// Immutable per-run description of both 1st-round primers plus their reverse
+// complements, and the 0-based offsets of every ambiguous (UMI) base within
+// each of those four strings. Precomputing the RC strings and UMI offsets
+// once lets the per-read hot loop avoid recomputing IUPAC bookkeeping.
 struct PrimerLayout {
     std::string forward_primer;
     std::string reverse_primer;
@@ -19,6 +36,7 @@ struct PrimerLayout {
     std::vector<int> reverse_reverse_complement_umi_positions;
 };
 
+// Emit the command-line synopsis when arg count / parsing fails.
 void PrintUsage(const char* program_name) {
     std::cerr
         << "Usage: " << program_name
@@ -27,6 +45,11 @@ void PrintUsage(const char* program_name) {
         << "and trim the read to the insert region bounded by the primer pair.\n";
 }
 
+// Locate a primer pair within `uppercase_sequence` using the leftmost match
+// for `left_primer` and the rightmost match for `right_primer`, each allowing
+// up to `max_mismatches` Hamming-style errors. Writes primer start offsets
+// into *left_start / *right_start. Returns false if either primer is absent
+// or the primers overlap (would leave no insert).
 bool TryFindPrimerSpan(
     const std::string& uppercase_sequence,
     const std::string& left_primer,
@@ -51,6 +74,10 @@ bool TryFindPrimerSpan(
     return true;
 }
 
+// Forward-orientation path: read goes forward-primer ... insert ... RC(reverse-primer).
+// On success, rewrites `record` in place: header gets the dual UMI tag, and
+// sequence/quality are trimmed to the insert (first base after the forward
+// UMI block through the last base before the reverse UMI block).
 bool ExtractForwardRead(
     ont::fastq::Record* record,
     const std::string& uppercase_sequence,
@@ -78,6 +105,10 @@ bool ExtractForwardRead(
     const std::string reverse_umi = ont::seq::ExtractIndexedBases(
         right_primer_region, layout.reverse_reverse_complement_umi_positions);
 
+    // Trim boundaries: drop everything up to and including the last UMI base of
+    // the forward primer; stop just before the first UMI base of the RC'd
+    // reverse primer. `.back()+1U` and `.front()` give half-open bounds on the
+    // insert. A false return means the primers landed in an impossible order.
     const std::size_t trimmed_start =
         left_start + static_cast<std::size_t>(layout.forward_umi_positions.back()) + 1U;
     const std::size_t trimmed_end =
@@ -92,6 +123,11 @@ bool ExtractForwardRead(
     return true;
 }
 
+// Reverse-orientation path: read goes reverse-primer ... insert ... RC(forward-primer).
+// The UMIs are extracted in read space, then reverse-complemented so the
+// ":UMI_<fwd>_<rev>" tag is always written in the canonical forward frame.
+// The payload is also reverse-complemented (with quality reversed) before
+// being trimmed, so downstream consumers see a forward-oriented insert.
 bool ExtractReverseRead(
     ont::fastq::Record* record,
     const std::string& uppercase_sequence,
@@ -119,12 +155,18 @@ bool ExtractReverseRead(
     const std::string right_umi = ont::seq::ExtractIndexedBases(
         right_primer_region, layout.forward_reverse_complement_umi_positions);
 
+    // Canonicalise to forward orientation: the "right" UMI in read space was
+    // actually derived from the forward primer (RC'd), so reverse-complement
+    // it to recover the true forward UMI; mirror for the reverse UMI.
     const std::string forward_umi = ont::seq::ReverseComplement(right_umi);
     const std::string reverse_umi = ont::seq::ReverseComplement(left_umi);
 
     const std::string reverse_complement_sequence = ont::seq::ReverseComplement(record->sequence);
     const std::string reverse_quality = ont::seq::ReverseQuality(record->quality);
 
+    // Map read-space primer coordinates into RC-space coordinates so the same
+    // insert-trimming offsets used in the forward path apply here. The length
+    // subtraction flips a [start, start+primer_size) range around the sequence.
     const std::size_t reverse_left_start =
         reverse_complement_sequence.size() - (right_start + layout.forward_primer.size());
     const std::size_t reverse_right_start =
@@ -144,6 +186,9 @@ bool ExtractReverseRead(
     return true;
 }
 
+// Try forward orientation first, then reverse. Returns false if neither path
+// can locate a valid primer pair within the allowed mismatch budget, in which
+// case the caller drops the read.
 bool ExtractAndAnnotateRead(
     ont::fastq::Record* record,
     const PrimerLayout& layout,
@@ -169,6 +214,10 @@ int main(int argc, char** argv) {
     const std::string input_fastq = argv[1];
     const std::string output_fastq = argv[2];
 
+    // Precompute orientations and UMI index lists. AmbiguousPositions returns
+    // the 0-based offsets of every non-ACGT base (N, K, etc.); those positions
+    // are where Illumina-style degenerate bases were incorporated during PCR
+    // and therefore carry the per-molecule UMI content.
     PrimerLayout layout;
     layout.forward_primer = ont::seq::ToUpperCopy(argv[3]);
     layout.reverse_primer = ont::seq::ToUpperCopy(argv[4]);
@@ -181,6 +230,8 @@ int main(int argc, char** argv) {
     layout.reverse_reverse_complement_umi_positions =
         ont::seq::AmbiguousPositions(layout.reverse_primer_reverse_complement);
 
+    // A primer with zero ambiguous bases carries no UMI content; there is
+    // nothing to extract and downstream tools expect a populated dual UMI.
     if (layout.forward_umi_positions.empty() ||
         layout.reverse_umi_positions.empty() ||
         layout.forward_reverse_complement_umi_positions.empty() ||
@@ -205,6 +256,9 @@ int main(int argc, char** argv) {
     std::uint64_t kept_reads = 0;
     std::uint64_t dropped_reads = 0;
 
+    // Stream the input FASTQ record by record: avoid mutating the source
+    // record so the ExtractAndAnnotateRead failure path leaves caller state
+    // untouched; only annotated copies for successful reads reach the writer.
     try {
         ont::fastq::Reader reader(input_fastq);
         ont::fastq::Writer writer(output_fastq);
@@ -225,6 +279,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Single-line stderr summary. Consumed by batch wrapper scripts to report
+    // the retention rate of the UMI extraction step.
     std::cerr << "[UmiExtractor] total=" << total_reads
               << " kept=" << kept_reads
               << " dropped=" << dropped_reads

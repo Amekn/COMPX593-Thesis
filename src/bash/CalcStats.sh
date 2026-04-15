@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# CalcStats.sh -- post-alignment QC summariser used by DMSPolishing.sh (and
+# ad-hoc from the command line) to score a BAM against its reference. Wraps
+# `samtools stats` to extract mapped bases, mismatches, and mapped-read counts,
+# then walks CIGAR strings on primary alignments only to count inserted and
+# deleted bases. Emits nine labelled metrics on stdout ready for logging or
+# CSV consumption. Input: one BAM path. Output: key/value lines on stdout.
+# Requires samtools, awk, mktemp on PATH.
+
 usage() {
   cat >&2 <<'EOF'
 Usage:
@@ -12,22 +20,33 @@ Description:
 EOF
 }
 
+# Print an error to stderr and exit non-zero. $1...: message.
 die() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
 }
 
+# Abort with a clear message if the given executable is missing from PATH.
+# $1: command name.
 require_command() {
   local command_name=$1
   command -v "$command_name" >/dev/null 2>&1 || die "Required command not found: $command_name"
 }
 
+# Pull the numeric value of a single `samtools stats` SN-section key.
+# samtools stats emits lines shaped `SN\t<key>\t<value>`; we key on exact
+# match of $2 and print $3 for the first hit. $1: stats file, $2: key
+# (including trailing colon).
 extract_sn_metric() {
   local stats_path=$1
   local metric_name=$2
   awk -F '\t' -v key="$metric_name" '$1 == "SN" && $2 == key { print $3; exit }' "$stats_path"
 }
 
+# Sum inserted and deleted bases across primary alignments by walking each
+# CIGAR string token-by-token. $1: BAM path. Stdout: "<ins> <del>" on one
+# line. samtools stats does not break indel counts out this way, so we
+# compute them ourselves to stay consistent across polished/unpolished BAMs.
 count_primary_indel_bases() {
   local bam_path=$1
 
@@ -37,6 +56,9 @@ count_primary_indel_bases() {
   #   0x800 supplementary
   samtools view -F 0x904 "$bam_path" \
     | awk '
+        # SAM field 6 is the CIGAR. Peel off one <length><op> token at a time
+        # via `match`, accumulating I/D bases. All other ops (M/N/S/H/P/=/X)
+        # are ignored; we only care about indel totals.
         {
           cigar = $6
           while (match(cigar, /[0-9]+[MIDNSHP=X]/)) {
@@ -51,6 +73,7 @@ count_primary_indel_bases() {
             cigar = substr(cigar, RSTART + RLENGTH)
           }
         }
+        # "+ 0" coerces uninitialised awk variables to 0 for empty BAMs.
         END {
           print inserted_bases + 0, deleted_bases + 0
         }
@@ -74,6 +97,8 @@ main() {
   require_command awk
   require_command mktemp
 
+  # Build a trap using %q so the temp path survives spaces / odd characters
+  # in `mktemp` output when expanded by `trap ... EXIT`.
   local temporary_stats
   local cleanup_trap
   temporary_stats=$(mktemp)
@@ -91,6 +116,8 @@ main() {
   reads_mapped=$(extract_sn_metric "$temporary_stats" "reads mapped:")
   raw_total_sequences=$(extract_sn_metric "$temporary_stats" "raw total sequences:")
 
+  # Default any missing SN values to 0 so downstream awk arithmetic is safe
+  # even when samtools stats omits a row (e.g. empty BAMs).
   bases_mapped=${bases_mapped:-0}
   mismatch_count=${mismatch_count:-0}
   reads_mapped=${reads_mapped:-0}
@@ -99,6 +126,8 @@ main() {
   local inserted_bases deleted_bases
   read -r inserted_bases deleted_bases < <(count_primary_indel_bases "$bam_path")
 
+  # Derive rates in awk rather than bash because bash has no floating-point
+  # arithmetic; all guards below default to 0 on divide-by-zero (empty BAM).
   awk \
     -v raw_total_sequences="$raw_total_sequences" \
     -v reads_mapped="$reads_mapped" \
@@ -119,6 +148,9 @@ main() {
           average_mismatches_per_mapped_read = mismatch_count / reads_mapped
         }
 
+        # mismatch_rate counts substitutions only (matches `samtools stats`
+        # "error rate"); overall_error_rate folds in indel bases to report
+        # the full per-base error as seen by the polished alignment.
         if (bases_mapped == 0) {
           mismatch_rate = 0
           overall_error_rate = 0

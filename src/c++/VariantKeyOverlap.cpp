@@ -1,3 +1,13 @@
+// VariantKeyOverlap.cpp
+// Produces executable: VariantKeyOverlap
+// Usage: VariantKeyOverlap [--exclude-wt] <counts1.tsv> <counts2.tsv> [counts3.tsv ...]
+//
+// Pipeline role: compare DualSiteDMSFilter --out-counts TSVs across any
+// number of datasets (e.g. different basecallers, training runs, or
+// biological replicates). Uses the variant_key column as an unordered set
+// per dataset and emits: unique counts per dataset, pairwise intersections
+// and Jaccard, overlap-by-multiplicity (how many variants are shared in k
+// of n datasets), and exact presence-pattern counts.
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
@@ -12,6 +22,8 @@
 
 using namespace std;
 
+// One input file's state: stable id (D1, D2, ...), display label, path, and
+// the loaded distinct variant_key set.
 struct Dataset {
     string id;
     string label;
@@ -19,11 +31,13 @@ struct Dataset {
     unordered_set<string> variants;
 };
 
+// Strip directory components from a path for use as a display label.
 static string basename_of(const string& path) {
     size_t pos = path.find_last_of("/\\");
     return (pos == string::npos) ? path : path.substr(pos + 1);
 }
 
+// Trim ASCII whitespace from both ends of a string and return a new copy.
 static string trim_copy(const string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
     if (start == string::npos) return string();
@@ -31,6 +45,7 @@ static string trim_copy(const string& s) {
     return s.substr(start, end - start + 1);
 }
 
+// Print CLI contract and feature list to stderr.
 static void usage(const char* prog) {
     cerr << "Usage: " << prog << " [--exclude-wt] <counts1.tsv> <counts2.tsv> [counts3.tsv ...]\n\n"
          <<
@@ -48,6 +63,10 @@ Options:
 )";
 }
 
+// Read one counts TSV and return its distinct variant_key set. Skips the
+// 'variant_key' header row, blank lines, and (when requested) the 'WT' key
+// so synonymous wild-type calls do not dominate the overlap statistics.
+// Reserve of 1<<15 = 32k buckets matches typical post-filter variant counts.
 static unordered_set<string> load_variant_keys(const string& path, bool exclude_wt) {
     ifstream in(path);
     if (!in) {
@@ -64,9 +83,13 @@ static unordered_set<string> load_variant_keys(const string& path, bool exclude_
         line = trim_copy(line);
         if (line.empty()) continue;
 
+        // Variant key is the first tab-separated field; anything after it
+        // (counts, metadata) is ignored here.
         size_t tab = line.find('\t');
         string key = trim_copy((tab == string::npos) ? line : line.substr(0, tab));
         if (key.empty()) continue;
+        // Skip the TSV header only if it appears on the very first line;
+        // a downstream row literally named 'variant_key' would still load.
         if (line_no == 1 && key == "variant_key") continue;
         if (exclude_wt && key == "WT") continue;
         variants.insert(std::move(key));
@@ -75,6 +98,8 @@ static unordered_set<string> load_variant_keys(const string& path, bool exclude_
     return variants;
 }
 
+// Count elements present in both sets. Iterates the smaller side for speed,
+// matching the O(min(|a|,|b|)) average cost used in UmiOverlap.
 static uint64_t intersection_size(const unordered_set<string>& a, const unordered_set<string>& b) {
     const unordered_set<string>* small = &a;
     const unordered_set<string>* large = &b;
@@ -116,6 +141,8 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Assign stable dataset ids D1, D2, ... in argv order so the
+        // pattern-counts section has deterministic, short column names.
         vector<Dataset> datasets;
         datasets.reserve(paths.size());
         for (size_t i = 0; i < paths.size(); ++i) {
@@ -131,6 +158,10 @@ int main(int argc, char** argv) {
         uint64_t total_unique_entries = 0;
         for (const auto& ds : datasets) total_unique_entries += ds.variants.size();
 
+        // Membership matrix keyed by variant_key: each value is an n-long
+        // 0/1 vector marking presence in dataset i. Reserve ~1.3x the sum
+        // of per-dataset cardinalities to keep load factor sane even when
+        // variants are largely disjoint.
         unordered_map<string, vector<uint8_t>> membership;
         membership.reserve(static_cast<size_t>(total_unique_entries * 1.3) + 1);
 
@@ -141,6 +172,9 @@ int main(int argc, char** argv) {
             }
         }
 
+        // multiplicity_counts[k] = variants present in exactly k datasets;
+        // pattern_counts maps the exact presence pattern string (e.g.
+        // "D1&D3") to its variant count for UpSet-style reporting.
         vector<uint64_t> multiplicity_counts(n + 1, 0);
         unordered_map<string, uint64_t> pattern_counts;
         pattern_counts.reserve(membership.size());
@@ -164,6 +198,8 @@ int main(int argc, char** argv) {
             if (count >= 2) ++shared_in_at_least_two;
         }
 
+        // Sort patterns by descending count, then lexicographically on the
+        // pattern string so the output is deterministic across runs.
         vector<pair<string, uint64_t>> pattern_items(pattern_counts.begin(), pattern_counts.end());
         sort(pattern_items.begin(), pattern_items.end(), [](const auto& x, const auto& y) {
             if (x.second != y.second) return x.second > y.second;
@@ -184,6 +220,8 @@ int main(int argc, char** argv) {
             cout << ds.id << '\t' << ds.label << '\t' << ds.variants.size() << '\t' << ds.path << '\n';
         }
 
+        // Pairwise Jaccard table; upper triangle only (i < j) since Jaccard
+        // is symmetric. Division guards against the all-empty edge case.
         cout << "\n# PairwiseIntersections\n";
         cout << "dataset_a\tdataset_b\tshared_unique_variants\tjaccard\n";
         for (size_t i = 0; i < n; ++i) {

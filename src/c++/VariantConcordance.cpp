@@ -1,3 +1,13 @@
+// VariantConcordance: population-level similarity metrics between two variant
+// distributions (a "source" distribution and a "ground-truth" distribution).
+//
+// Library component of the thesis pipeline. Produces the static archive
+// `libont_variant_concordance.a` linked by the VariantConcordance tool. Given
+// two variant_key/count TSVs (as emitted by DualSiteDMSFilter --out-counts)
+// and a minimum count threshold, computes: per-set haplotype counts, set
+// overlap, exact overlap mass (L1 intersection of the two distributions),
+// weighted Jaccard, Jensen-Shannon similarity (1 - JSD/log2), and Spearman's
+// rank correlation on the top 100 most-frequent ground-truth variants.
 #include "ont_tools/VariantConcordance.hpp"
 
 #include <algorithm>
@@ -17,6 +27,9 @@ namespace ont_tools {
 
 namespace {
 
+// Return a copy of `text` with ASCII whitespace stripped from both ends.
+// Used when parsing TSV fields where hand-edited files sometimes carry
+// trailing spaces or stray CR bytes.
 std::string trim_copy(const std::string& text) {
     const std::size_t start = text.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) {
@@ -26,6 +39,8 @@ std::string trim_copy(const std::string& text) {
     return text.substr(start, end - start + 1);
 }
 
+// Split a single TSV line on literal '\t'. Preserves empty trailing fields and
+// does not trim; trimming is applied per-field by the caller where needed.
 std::vector<std::string> split_tsv_line(const std::string& line) {
     std::vector<std::string> fields;
     std::size_t start = 0;
@@ -41,6 +56,9 @@ std::vector<std::string> split_tsv_line(const std::string& line) {
     return fields;
 }
 
+// Parse a variant count field as a non-negative decimal integer. Throws
+// runtime_error citing `path` and `line_number` on any parse failure so the
+// caller can surface a location-aware error message to the user.
 std::uint64_t parse_count_or_throw(
     const std::string& text,
     const std::string& path,
@@ -69,6 +87,10 @@ std::uint64_t parse_count_or_throw(
     return static_cast<std::uint64_t>(value);
 }
 
+// Exact overlap mass = sum over variants of min(p_source, p_gt), i.e. the
+// total probability mass both distributions agree on. This equals
+// 1 - 0.5 * L1(p,q); higher is more concordant. Returns 0.0 if either input
+// is empty (the distribution is undefined).
 double compute_exact_overlap_mass(
     const std::unordered_map<std::string, std::uint64_t>& source_counts,
     const std::unordered_map<std::string, std::uint64_t>& ground_truth_counts
@@ -110,6 +132,10 @@ double compute_exact_overlap_mass(
     return overlap;
 }
 
+// Weighted Jaccard index: sum(min(a_i, b_i)) / sum(max(a_i, b_i)) taken over
+// the union of keys. Robust to the relative-abundance skew between Illumina
+// and nanopore call sets, and unlike set Jaccard it penalises count
+// disagreement even on shared variants. Returns 0.0 on an empty union.
 double compute_weighted_jaccard(
     const std::unordered_map<std::string, std::uint64_t>& source_counts,
     const std::unordered_map<std::string, std::uint64_t>& ground_truth_counts
@@ -141,6 +167,10 @@ double compute_weighted_jaccard(
     return static_cast<double>(numerator) / static_cast<double>(denominator);
 }
 
+// Jensen-Shannon similarity = 1 - JSD(p,q)/log(2), mapping a JSD in [0, log2]
+// into a similarity in [0, 1] (1 == identical, 0 == disjoint). Implemented by
+// summing the two KL terms against the midpoint and dividing the total by
+// log(2) so the natural-log-based KL is converted to bits.
 double compute_js_similarity(
     const std::unordered_map<std::string, std::uint64_t>& source_counts,
     const std::unordered_map<std::string, std::uint64_t>& ground_truth_counts
@@ -190,6 +220,9 @@ double compute_js_similarity(
     return std::max(0.0, 1.0 - normalized);
 }
 
+// Compute the fractional ("average") ranks of `values`. Ties receive the
+// midpoint rank of the tied block, matching the standard Spearman tie-handling
+// convention. Returned vector is index-aligned with the input.
 std::vector<double> average_ranks(const std::vector<double>& values) {
     std::vector<std::pair<std::size_t, double>> indexed;
     indexed.reserve(values.size());
@@ -225,6 +258,11 @@ std::vector<double> average_ranks(const std::vector<double>& values) {
     return ranks;
 }
 
+// Pearson correlation of two equal-length vectors. Returns 0.0 on empty/size
+// mismatch. When either input has zero variance the correlation is
+// conventionally undefined; we return 1.0 iff the two inputs are elementwise
+// equal (within 1e-12) and 0.0 otherwise, which keeps Spearman monotonic when
+// both distributions are constant.
 double pearson_correlation(const std::vector<double>& left, const std::vector<double>& right) {
     if (left.size() != right.size() || left.empty()) {
         return 0.0;
@@ -275,6 +313,10 @@ double pearson_correlation(const std::vector<double>& left, const std::vector<do
     return numerator / (left_scale * right_scale);
 }
 
+// Spearman rank correlation restricted to the top-100 most-abundant variants
+// in the ground truth, with the corresponding source counts (0 if absent).
+// Focuses the metric on the populated tail of the DMS library rather than
+// letting abundant singletons dominate. Rank ties use average ranks.
 double compute_top100_spearman(
     const std::unordered_map<std::string, std::uint64_t>& source_counts_all,
     const std::unordered_map<std::string, std::uint64_t>& ground_truth_high_counts
@@ -285,6 +327,8 @@ double compute_top100_spearman(
         ranked_ground_truth.push_back(item);
     }
 
+    // Sort by count descending; break ties by variant_key ascending so the
+    // top-100 selection is deterministic across runs.
     std::sort(ranked_ground_truth.begin(), ranked_ground_truth.end(), [](const auto& left, const auto& right) {
         if (left.second != right.second) {
             return left.second > right.second;
@@ -296,6 +340,9 @@ double compute_top100_spearman(
         return 0.0;
     }
 
+    // Single-variant GT edge case: Spearman is undefined for n=1. Treat
+    // exact count equality as perfect correlation and any disagreement as
+    // zero so the metric degrades gracefully rather than producing NaN.
     if (ranked_ground_truth.size() == 1U) {
         const auto& entry = ranked_ground_truth.front();
         const auto source_it = source_counts_all.find(entry.first);
@@ -322,6 +369,12 @@ double compute_top100_spearman(
 
 }  // namespace
 
+// Read a variant_key/count TSV (as emitted by DualSiteDMSFilter --out-counts)
+// and aggregate duplicate keys by summing their counts. Accepts an optional
+// header row (columns may be in any order provided both `variant_key` and
+// `count` are present) and tolerates '#'-prefixed comment lines. Duplicate
+// variant_keys in the input are additively folded into the store so that
+// concatenated files or re-run outputs merge cleanly.
 VariantCountStore load_variant_count_store(const std::string& path) {
     std::ifstream input(path);
     if (!input) {
@@ -399,6 +452,11 @@ VariantCountStore load_variant_count_store(const std::string& path) {
     return store;
 }
 
+// Top-level entry point. Applies `haplotype_threshold` to both stores to
+// filter out low-count noise (singleton errors), then computes the full
+// metric battery on the filtered populations. The top-100 Spearman keeps
+// operating on the unfiltered source counts so the metric is not distorted
+// when a GT-abundant variant is suppressed in the source by the threshold.
 ConcordanceMetrics compute_variant_concordance(
     const VariantCountStore& source_store,
     const VariantCountStore& ground_truth_store,
@@ -433,6 +491,10 @@ ConcordanceMetrics compute_variant_concordance(
         }
     }
 
+    // Build dense count vectors over the union of threshold-passing sequences.
+    // For each sequence, source-only or gt-only keys receive a zero count on
+    // the opposite side, which is exactly the semantics the mass/JSD/weighted
+    // Jaccard math requires.
     std::unordered_map<std::string, std::uint64_t> filtered_source_counts;
     filtered_source_counts.reserve(union_sequences.size());
     std::unordered_map<std::string, std::uint64_t> filtered_ground_truth_counts;

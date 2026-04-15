@@ -1,3 +1,12 @@
+// VariantConcordanceCli.cpp
+// Produces executable: VariantConcordance
+// Usage: VariantConcordance <source_variant.tsv> <ground_truth_variant.tsv> <haplotype_threshold>
+//
+// Pipeline role: top-level driver that computes exact-haplotype concordance
+// between a nanopore variant_key/count TSV and a ground-truth TSV (typically
+// MGI short-read). Loads both stores via ont_tools and writes a one-row
+// TSV with the metrics defined in ConcordanceMetrics. Metric behaviour is
+// aligned with experimental/ont/scripts/model_performance_report.py.
 #include "ont_tools/VariantConcordance.hpp"
 
 #include <cstdint>
@@ -9,6 +18,7 @@
 
 using namespace std;
 
+// Print CLI contract and metric documentation to stderr.
 static void usage(const char* prog) {
     cerr << "Usage: " << prog << " <source_variant.tsv> <ground_truth_variant.tsv> <haplotype_threshold>\n\n"
          <<
@@ -39,6 +49,8 @@ top 100 haplotypes above threshold.
 )";
 }
 
+// Parse the CLI threshold argument as an unsigned 64-bit integer. Rejects
+// strings with trailing garbage so e.g. "5x" does not silently pass as 5.
 static std::uint64_t parse_threshold(const string& text) {
     size_t consumed = 0;
     const unsigned long long value = stoull(text, &consumed);
@@ -70,6 +82,8 @@ int main(int argc, char** argv) {
         const string ground_truth_path = argv[2];
         const std::uint64_t haplotype_threshold = parse_threshold(argv[3]);
 
+        // Load both stores into memory before metric computation: the
+        // metrics require global lookups on both sides.
         const auto source_store = ont_tools::load_variant_count_store(source_path);
         const auto ground_truth_store = ont_tools::load_variant_count_store(ground_truth_path);
         const auto metrics = ont_tools::compute_variant_concordance(
@@ -78,6 +92,9 @@ int main(int argc, char** argv) {
             haplotype_threshold
         );
 
+        // Emit a two-row TSV: a header followed by the single metric row.
+        // setprecision(10) is used for fractional fields to keep downstream
+        // R/Python parsers from silently rounding.
         cout << "haplotype_threshold\tsource_haplotypes\tgroundtruth_haplotypes\t"
              << "intersection_haplotypes\tunion_haplotypes\texact_overlap_mass\t"
              << "weighted_jaccard\tjensen_shannon_similarity\ttop100_spearman\n";

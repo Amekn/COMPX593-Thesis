@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
-"""Merge Bonito training arrays from multiple directories without large RAM spikes."""
+"""Memory-map merge of Bonito training-array triplets without RAM spikes.
+
+Bonito exports each training split as three parallel NumPy files --
+``chunks.npy``, ``references.npy``, ``reference_lengths.npy`` -- whose
+leading axis is a shared row (chunk) count. This utility concatenates
+multiple such triplets on disk using ``numpy.lib.format.open_memmap`` so
+building a combined A+B training set for the COMPX593 thesis fine-tune
+never has to hold all inputs in RAM at once.
+
+Key invariants the implementation enforces:
+    * Every input dataset's three arrays share the same leading axis.
+    * The ``chunks`` tail shape (all axes after the leading one) is
+      identical across every input; mismatches abort the merge.
+    * ``references`` widths may differ per input; the merged array is
+      padded to the global maximum width with zeros.
+    * Output dtypes are promoted via ``np.result_type`` so no input value
+      is silently narrowed.
+
+Optional features:
+    * ``--shuffle`` performs an on-disk permutation after the streaming
+      concat, keeping the three arrays' row correspondence intact.
+    * ``--target-chunk-mb`` bounds the per-block RAM budget of every
+      mmap-to-mmap copy.
+"""
 
 from __future__ import annotations
 
@@ -17,8 +40,10 @@ from numpy.lib.format import open_memmap
 try:
     from tqdm import tqdm as progress_bar
 except Exception:  # pragma: no cover
+    # tqdm is optional; fall back to a silent shim so the tool runs on
+    # minimal training-box environments without pulling in extras.
     class _NullProgressBar:
-        """Fallback progress bar used when tqdm is unavailable."""
+        """No-op stand-in for tqdm used when the library is not installed."""
 
         def __init__(self, *_args, **_kwargs) -> None:
             pass
@@ -33,16 +58,24 @@ except Exception:  # pragma: no cover
         return _NullProgressBar(*args, **kwargs)
 
 
+# Bonito's own training loader hard-codes these three filenames, so every
+# input dataset must expose them verbatim and every output directory
+# produces the same trio to remain drop-in compatible.
 REQUIRED_FILENAMES = ("chunks.npy", "references.npy", "reference_lengths.npy")
 
 
 class MergeError(RuntimeError):
-    """Raised when the input datasets cannot be merged safely."""
+    """Raised when the inputs fail validation or the merge cannot proceed.
+
+    Distinguished from unrelated ``RuntimeError``s so the top-level
+    ``__main__`` block can print a concise ``[ERROR]`` line and exit with
+    status 2 rather than dumping a traceback.
+    """
 
 
 @dataclass(frozen=True)
 class ArrayTripletPaths:
-    """Locations of the three required training arrays inside one dataset directory."""
+    """Resolved paths of the three required arrays inside one input directory."""
 
     chunks: Path
     references: Path
@@ -51,7 +84,11 @@ class ArrayTripletPaths:
 
 @dataclass(frozen=True)
 class DatasetMetadata:
-    """Lightweight header information gathered from one input dataset."""
+    """Per-input header snapshot used to plan the merge without reading payloads.
+
+    Stores row count, the invariant ``chunks`` tail shape, the per-dataset
+    reference width (may differ across inputs), and each array's dtype.
+    """
 
     directory: Path
     row_count: int
@@ -64,7 +101,7 @@ class DatasetMetadata:
 
 @dataclass(frozen=True)
 class OutputPaths:
-    """Destination filenames for the merged training arrays."""
+    """Resolved destination paths for the three merged arrays."""
 
     chunks: Path
     references: Path
@@ -73,7 +110,12 @@ class OutputPaths:
 
 @dataclass(frozen=True)
 class MergePlan:
-    """Derived merge layout shared across the streaming copy and shuffle stages."""
+    """Computed merge layout: totals, output shapes, and promoted dtypes.
+
+    Produced once up front by ``build_merge_plan`` and then consumed by the
+    streaming-copy and optional shuffle stages, guaranteeing they agree on
+    total row count, output shapes, and dtype promotions.
+    """
 
     datasets: list[DatasetMetadata]
     total_rows: int
@@ -86,7 +128,15 @@ class MergePlan:
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    """Create the command-line interface for the array merger."""
+    """Create the CLI parser for the training-array merger.
+
+    At least one input directory is required. ``--target-chunk-mb`` caps
+    the RAM footprint of each row-block copy; 64 MiB is a conservative
+    default that streams comfortably on training nodes with many other
+    processes active. ``--shuffle`` runs an extra on-disk permutation pass
+    (row-aligned across the three arrays) and ``--seed`` makes that pass
+    deterministic for reproducibility.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Merge Bonito training arrays (chunks, references, reference_lengths) "
@@ -125,7 +175,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def resolve_required_paths(dataset_directory: Path) -> ArrayTripletPaths:
-    """Locate the three required NumPy files in one input directory."""
+    """Return the triplet paths for a dataset, raising if any file is missing.
+
+    Raises:
+        MergeError: If one or more of ``chunks.npy``, ``references.npy``,
+            or ``reference_lengths.npy`` is absent.
+    """
     paths = ArrayTripletPaths(
         chunks=dataset_directory / REQUIRED_FILENAMES[0],
         references=dataset_directory / REQUIRED_FILENAMES[1],
@@ -145,7 +200,17 @@ def resolve_required_paths(dataset_directory: Path) -> ArrayTripletPaths:
 
 
 def inspect_dataset(dataset_directory: Path) -> DatasetMetadata:
-    """Read array headers with memmap mode and return merge-relevant metadata."""
+    """Collect header-only metadata for one dataset without reading payloads.
+
+    Uses ``mmap_mode="r"`` so only the ``.npy`` header plus a mapped view
+    is touched; the full arrays are never loaded into RAM. Validates the
+    expected dimensionality of each array (chunks >= 1-D, references 2-D,
+    reference_lengths 1-D) and confirms the leading-axis row counts agree
+    across the triplet.
+
+    Raises:
+        MergeError: On any dimensionality or row-count mismatch.
+    """
     triplet_paths = resolve_required_paths(dataset_directory)
     chunk_array = np.load(triplet_paths.chunks, allow_pickle=False, mmap_mode="r")
     reference_array = np.load(triplet_paths.references, allow_pickle=False, mmap_mode="r")
@@ -184,7 +249,12 @@ def inspect_dataset(dataset_directory: Path) -> DatasetMetadata:
 
 
 def compute_common_dtype(dtypes: Sequence[np.dtype]) -> np.dtype:
-    """Return a common dtype that can safely represent all supplied arrays."""
+    """Fold NumPy's type-promotion rules over a dtype sequence.
+
+    Uses ``np.result_type`` pairwise so the returned dtype can losslessly
+    represent every value under NumPy's standard casting rules (e.g. two
+    inputs with ``float16`` and ``float32`` promote to ``float32``).
+    """
     common = dtypes[0]
     for dtype in dtypes[1:]:
         common = np.result_type(common, dtype)
@@ -192,7 +262,17 @@ def compute_common_dtype(dtypes: Sequence[np.dtype]) -> np.dtype:
 
 
 def build_merge_plan(input_directories: Sequence[Path]) -> MergePlan:
-    """Inspect all inputs and derive the merged output shape and dtypes."""
+    """Inspect every input and compute the merged output layout.
+
+    Reconciles the per-input metadata into global totals: sums row counts,
+    checks that every dataset shares the same ``chunks`` tail shape, takes
+    the maximum ``references`` width (narrower inputs are later zero-padded),
+    and promotes dtypes via ``np.result_type``.
+
+    Raises:
+        MergeError: If no inputs are provided, an input path is not a
+            directory, or the datasets disagree on ``chunks`` tail shape.
+    """
     dataset_metadata: list[DatasetMetadata] = []
     progress = progress_bar(total=len(input_directories), desc="Inspecting headers", unit="dir")
 
@@ -238,7 +318,11 @@ def build_merge_plan(input_directories: Sequence[Path]) -> MergePlan:
 
 
 def resolve_output_paths(output_directory: Path) -> OutputPaths:
-    """Construct the destination array paths in the output directory."""
+    """Return the ``OutputPaths`` triple inside ``output_directory``.
+
+    Uses the same filenames as Bonito (``REQUIRED_FILENAMES``) so the
+    merged dataset is a drop-in replacement for a single training split.
+    """
     return OutputPaths(
         chunks=output_directory / REQUIRED_FILENAMES[0],
         references=output_directory / REQUIRED_FILENAMES[1],
@@ -247,7 +331,11 @@ def resolve_output_paths(output_directory: Path) -> OutputPaths:
 
 
 def ensure_output_paths_are_writable(output_paths: OutputPaths, overwrite: bool) -> None:
-    """Prevent accidental replacement of an existing merged dataset unless requested."""
+    """Guard against clobbering an existing merged dataset unless ``--overwrite``.
+
+    Raises:
+        MergeError: If any output file exists and ``overwrite`` is ``False``.
+    """
     for output_path in (output_paths.chunks, output_paths.references, output_paths.reference_lengths):
         if output_path.exists() and not overwrite:
             raise MergeError(
@@ -256,7 +344,16 @@ def ensure_output_paths_are_writable(output_paths: OutputPaths, overwrite: bool)
 
 
 def create_output_memmaps(plan: MergePlan, output_paths: OutputPaths) -> tuple[np.memmap, np.memmap, np.memmap]:
-    """Allocate the merged arrays as writable memmaps on disk."""
+    """Allocate the three output arrays on disk as writable memmaps.
+
+    Opening with ``mode="w+"`` creates each ``.npy`` file at full final
+    size, backed by a sparse file where supported; the OS zeroes pages on
+    first touch so no explicit fill is required for ``chunks`` or
+    ``reference_lengths``. ``merged_references`` is explicitly zeroed
+    afterwards because per-dataset writes only touch the first
+    ``reference_width`` columns and the remainder must stay zero to serve
+    as the pad region for narrower inputs.
+    """
     print("[INFO] Creating output memmaps ...")
     merged_chunks = open_memmap(
         output_paths.chunks,
@@ -277,7 +374,8 @@ def create_output_memmaps(plan: MergePlan, output_paths: OutputPaths) -> tuple[n
         shape=plan.reference_length_shape,
     )
 
-    # Reference rows are zero-padded out to the global maximum width.
+    # Explicit zero-fill of references so any trailing columns past a
+    # dataset's reference_width remain zero-padded in the merged array.
     merged_references[:] = 0
     return merged_chunks, merged_references, merged_reference_lengths
 
@@ -287,13 +385,22 @@ def estimate_rows_per_block(
     plan: MergePlan,
     target_bytes: int,
 ) -> int:
-    """Choose a row block size that fits approximately within the target memory budget."""
+    """Size each copy block so the three-array row combined fits in ``target_bytes``.
+
+    Sums the per-row byte cost across all three arrays in the OUTPUT
+    dtypes (which may be wider than the inputs after promotion) and floors
+    to the target budget. The minimum is clamped to one row so extremely
+    large single-row payloads still make progress. The maximum is clamped
+    to the dataset's row count so the block loop terminates cleanly on the
+    final partial block.
+    """
     chunk_elements_per_row = int(math.prod(metadata.chunk_tail_shape)) if metadata.chunk_tail_shape else 1
     chunk_bytes_per_row = chunk_elements_per_row * int(np.dtype(plan.chunks_dtype).itemsize)
     reference_bytes_per_row = metadata.reference_width * int(np.dtype(plan.references_dtype).itemsize)
     reference_length_bytes_per_row = int(np.dtype(plan.reference_lengths_dtype).itemsize)
 
     bytes_per_row = chunk_bytes_per_row + reference_bytes_per_row + reference_length_bytes_per_row
+    # ``max(1, ...)`` on bytes_per_row guards the degenerate zero-cost case.
     return max(1, min(metadata.row_count, target_bytes // max(1, bytes_per_row)))
 
 
@@ -304,11 +411,26 @@ def stream_merge(
     merged_reference_lengths: np.memmap,
     target_chunk_mb: float,
 ) -> None:
-    """Copy all input rows into the output memmaps in bounded blocks."""
+    """Stream every input triplet into the merged output memmaps block-by-block.
+
+    Datasets are written in the order supplied on the CLI: dataset 0
+    occupies rows ``[0, n0)``, dataset 1 rows ``[n0, n0+n1)``, and so on.
+    Within each dataset the rows are copied in contiguous blocks sized by
+    ``estimate_rows_per_block`` so peak RAM use is bounded by
+    ``target_chunk_mb``. References are written into the first
+    ``metadata.reference_width`` columns, leaving the remaining columns at
+    their zero-initialised state so narrower inputs are effectively
+    zero-padded out to the merged width. A final ``flush`` on all three
+    memmaps forces dirty pages to disk before the function returns.
+    """
     print("[INFO] Streaming arrays into output (mmap -> mmap) ...")
+    # MiB -> bytes; ``max(1, ...)`` avoids a zero budget if the user passes
+    # a tiny floating-point value.
     target_bytes = max(1, int(target_chunk_mb * 1024 * 1024))
     progress = progress_bar(total=plan.total_rows, desc="Streaming rows", unit="row")
 
+    # Rolling destination cursor: advances exactly by the number of rows
+    # copied in each block, independently of the per-dataset cursor below.
     destination_row_start = 0
     try:
         for metadata in plan.datasets:
@@ -325,9 +447,15 @@ def stream_merge(
                 source_row_end = min(metadata.row_count, source_row_start + rows_per_block)
                 destination_row_end = destination_row_start + (source_row_end - source_row_start)
 
+                # Slice-assignment between two memmaps uses NumPy's
+                # implicit dtype cast; the promoted output dtype ensures
+                # this stays lossless.
                 merged_chunks[destination_row_start:destination_row_end, ...] = source_chunks[
                     source_row_start:source_row_end, ...
                 ]
+                # Restrict the column slice to the source dataset's own
+                # reference_width so the zero pad on the right is
+                # preserved for narrower inputs.
                 merged_references[
                     destination_row_start:destination_row_end, : metadata.reference_width
                 ] = source_references[source_row_start:source_row_end, : metadata.reference_width]
@@ -341,6 +469,8 @@ def stream_merge(
     finally:
         progress.close()
 
+    # Force dirty mmap pages to disk so a subsequent reopen-for-shuffle
+    # observes the full, consistent streamed output.
     merged_chunks.flush()
     merged_references.flush()
     merged_reference_lengths.flush()
@@ -352,12 +482,22 @@ def shuffle_output_rows(
     target_chunk_mb: float,
     seed: int | None,
 ) -> None:
-    """Shuffle the merged arrays on disk while keeping row alignment intact."""
+    """Apply a single row permutation to all three merged arrays on disk.
+
+    The three arrays must stay row-aligned after shuffling, so the same
+    permutation is applied in lockstep. Because fancy indexing from a
+    memmap back into itself cannot overlap safely, the shuffled output is
+    written into ``*.tmp.npy`` memmaps alongside the originals and then
+    atomically ``os.replace``d. ``seed`` is forwarded to
+    ``np.random.default_rng`` so callers can reproduce a specific shuffle.
+    """
     print("[INFO] Shuffling merged rows ...")
     merged_chunks = np.load(output_paths.chunks, allow_pickle=False, mmap_mode="r")
     merged_references = np.load(output_paths.references, allow_pickle=False, mmap_mode="r")
     merged_reference_lengths = np.load(output_paths.reference_lengths, allow_pickle=False, mmap_mode="r")
 
+    # A single permutation over ``total_rows`` guarantees the three
+    # arrays remain row-aligned after shuffling.
     rng = np.random.default_rng(seed)
     permutation = rng.permutation(plan.total_rows)
 
@@ -386,6 +526,9 @@ def shuffle_output_rows(
         shape=plan.reference_length_shape,
     )
 
+    # Same bytes-per-row accounting as the streaming pass, but uses the
+    # merged plan's own dtypes/shapes because no per-dataset metadata is
+    # relevant during shuffle.
     chunk_elements_per_row = int(math.prod(plan.chunk_shape[1:])) if len(plan.chunk_shape) > 1 else 1
     chunk_bytes_per_row = chunk_elements_per_row * int(np.dtype(plan.chunks_dtype).itemsize)
     reference_bytes_per_row = plan.reference_shape[1] * int(np.dtype(plan.references_dtype).itemsize)
@@ -397,6 +540,7 @@ def shuffle_output_rows(
     try:
         for shuffled_row_start in range(0, plan.total_rows, rows_per_block):
             shuffled_row_end = min(plan.total_rows, shuffled_row_start + rows_per_block)
+            # Fancy-index with the block's slice of the global permutation.
             row_indices = permutation[shuffled_row_start:shuffled_row_end]
 
             shuffled_chunks[shuffled_row_start:shuffled_row_end, ...] = merged_chunks[row_indices, ...]
@@ -414,13 +558,19 @@ def shuffle_output_rows(
     shuffled_references.flush()
     shuffled_reference_lengths.flush()
 
+    # ``os.replace`` is atomic on POSIX/Windows, so a crash after a
+    # successful rename still leaves a consistent final output.
     os.replace(temporary_paths.chunks, output_paths.chunks)
     os.replace(temporary_paths.references, output_paths.references)
     os.replace(temporary_paths.reference_lengths, output_paths.reference_lengths)
 
 
 def print_summary(plan: MergePlan, output_paths: OutputPaths, shuffled: bool) -> None:
-    """Print a concise summary of the merged dataset written to disk."""
+    """Emit a single ``[DONE]`` block describing shapes, dtypes, and row total.
+
+    Printed to stdout so operators can immediately confirm the merged
+    dataset matches their expectation without rerunning ``ReadNumpy.py``.
+    """
     print(f"[DONE] Wrote merged arrays to {output_paths.chunks.parent}:")
     if shuffled:
         print("       rows shuffled: yes")
@@ -440,7 +590,11 @@ def print_summary(plan: MergePlan, output_paths: OutputPaths, shuffled: bool) ->
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the command-line entry point."""
+    """CLI entry point: plan, allocate, stream, optional shuffle, and summarise.
+
+    Returns ``0`` on success; ``MergeError``s escape to the top-level
+    ``__main__`` block, which prints a concise message and exits with 2.
+    """
     arguments = build_argument_parser().parse_args(argv)
     input_directories = [Path(directory).resolve() for directory in arguments.input_dirs]
     output_directory = Path(arguments.output).resolve()

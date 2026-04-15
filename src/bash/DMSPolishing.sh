@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# DMSPolishing.sh -- end-to-end per-model polishing pipeline for one nanopore
+# dataset. Given a Bonito-exported model directory + POD5 directory (or a
+# pre-existing basecalled BAM), runs: Dorado basecall -> BAM->FASTQ ->
+# fastplong length filter -> minimap2 align -> primary-alignment extraction ->
+# DualSiteDMSFilter (read-level polish + variant-key TSV) -> re-align polished
+# FASTQ. Produces the polished FASTQ at --out, a variant-key TSV, the primary
+# and polished sorted BAMs, and a timestamped timeline.log. Used per-model in
+# the thesis' DMS benchmarking loop. Depends on dorado, samtools, minimap2,
+# fastplong, awk, tee and the project's DualSiteDMSFilter executable.
+
 usage() {
   cat >&2 <<'EOF'
 Usage:
@@ -30,28 +40,37 @@ Notes:
 EOF
 }
 
+# Human-readable timestamp for log lines.
 timestamp() {
   date +"%Y-%m-%d %H:%M:%S"
 }
 
+# Emit one time-stamped info line; every stdout/stderr line in main() is
+# tee'd into the timeline.log via `exec > >(tee ...)`.
 log() {
   printf '[%s] %s\n' "$(timestamp)" "$*"
 }
 
+# Visual section divider in the timeline log between pipeline stages.
 step() {
   printf '\n[%s] ===== %s =====\n' "$(timestamp)" "$*"
 }
 
+# Error and abort. $*: message.
 die() {
   log "ERROR: $*"
   exit 1
 }
 
+# Guard that $1 is available on PATH; die with a clear message otherwise.
 require_command() {
   local command_name=$1
   command -v "$command_name" >/dev/null 2>&1 || die "Required command not found: $command_name"
 }
 
+# Read the first meaningful (non-blank, non-'#'-comment) line from the zone
+# file and echo it. This is the DMS-window descriptor consumed by
+# DualSiteDMSFilter. $1: zones file path.
 read_zone_string() {
   local zone_file=$1
   awk '
@@ -61,6 +80,9 @@ read_zone_string() {
   ' "$zone_file"
 }
 
+# Resolve which DualSiteDMSFilter binary to invoke, preferring an explicit
+# --filter-bin override, then PATH, then the in-tree build directory.
+# $1: explicit override or "", $2: directory of this script. Stdout: path.
 resolve_filter_binary() {
   local requested_path=$1
   local script_directory=$2
@@ -86,12 +108,15 @@ resolve_filter_binary() {
   die "DualSiteDMSFilter was not found on PATH or under $project_root/build"
 }
 
+# Assert a regular file exists at $1 (with human label $2) or die.
 require_file() {
   local path=$1
   local label=$2
   [[ -f "$path" ]] || die "$label does not exist: $path"
 }
 
+# Assert a path exists (file OR directory) at $1 (with label $2). Used for
+# POD5 inputs and model roots where either form is acceptable.
 require_path() {
   local path=$1
   local label=$2
@@ -99,6 +124,13 @@ require_path() {
 }
 
 main() {
+  # Pipeline defaults tuned for the IgA Fc DMS amplicons:
+  #   threads=32          -- saturates the thesis workstation
+  #   kit=SQK-NBD114-24   -- Nanopore kit used throughout the thesis
+  #   min/max length      -- Fc amplicon is ~700 bp; 600-800 keeps full-length
+  #                          reads and drops adapter-dimer / chimeric reads
+  #   max_indel events/bp -- conservative polish cutoffs for DualSiteDMSFilter
+  #   mut_codon_library   -- DMS library constraint (NNK = 32 codons)
   local model_path=""
   local pod5_path=""
   local basecall_bam=""
@@ -188,6 +220,8 @@ main() {
     exit 1
   }
 
+  # Two modes are mutually exclusive: either supply a pre-basecalled BAM
+  # (skip dorado) or a model+POD5 pair (run dorado). Reject combinations.
   if [[ -n "$basecall_bam" ]]; then
     [[ -z "$model_path" && -z "$pod5_path" ]] || die "Use either --bam or (--model and --test), not both."
   else
@@ -227,14 +261,25 @@ main() {
   zone_string=$(read_zone_string "$zones_file")
   [[ -n "$zone_string" ]] || die "Zone file does not contain a usable zone string: $zones_file"
 
+  # Strip the polished-FASTQ extension to derive a common stem for every
+  # intermediate artifact; supports both .fastq and .fq inputs.
   local output_prefix=${output_fastq%.fastq}
   output_prefix=${output_prefix%.fq}
   local timeline_log="${output_prefix}.timeline.log"
   local output_tsv="${output_prefix}.tsv"
 
   mkdir -p "$(dirname "$output_fastq")"
+  # Fan every subsequent stdout/stderr byte into the timeline log as well as
+  # the terminal. `-a` appends, so reruns accumulate rather than truncate.
   exec > >(tee -a "$timeline_log") 2>&1
 
+  # Intermediate artifacts written next to $output_fastq:
+  #   raw_bam               -- unfiltered dorado output (or passthrough --bam)
+  #   raw_fastq             -- BAM->FASTQ extraction
+  #   filtered_fastq        -- post fastplong length filter
+  #   aligned_sorted_bam    -- coordinate-sorted full minimap2 output
+  #   primary_name_sorted_bam -- primaries only, name-sorted for the filter
+  #   polished_aligned_bam  -- coordinate-sorted re-alignment of polished reads
   local raw_bam="${output_prefix}.basecalled.bam"
   local raw_fastq="${output_prefix}.basecalled.fq"
   local filtered_fastq="${output_prefix}.len${min_length}_${max_length}.fq"
@@ -262,6 +307,8 @@ main() {
     log "kit_name        = $kit_name"
 
     step "Basecalling with dorado"
+    # --trim all removes adapters and barcodes in dorado so downstream
+    # fastplong can be run with adapter trimming disabled.
     dorado basecaller "$model_path" "$pod5_path" \
       --kit-name "$kit_name" \
       --trim all \
@@ -274,6 +321,8 @@ main() {
   log "raw_fastq       = $raw_fastq"
 
   step "Length filtering"
+  # fastplong with trimming/quality off -- length-only gate so we preserve
+  # dorado's --trim all work and keep base qualities untouched.
   fastplong \
     --disable_adapter_trimming \
     --disable_quality_filtering \
@@ -285,12 +334,17 @@ main() {
   log "filtered_fastq  = $filtered_fastq"
 
   step "Align filtered reads"
+  # map-ont preset: the canonical nanopore settings (kmer 15, splice-aware
+  # off, lenient gap costs). `samtools view -u` keeps the stream uncompressed
+  # while piping to the sorter to avoid two rounds of BAM compression.
   minimap2 -t "$threads" -ax map-ont "$reference_fasta" "$filtered_fastq" \
     | samtools view -u - \
     | samtools sort -@ "$threads" -o "$aligned_sorted_bam" -
   log "aligned_bam     = $aligned_sorted_bam"
 
   step "Extract primary alignments"
+  # Drop unmapped/secondary/supplementary (0x904) and name-sort so downstream
+  # DualSiteDMSFilter can rely on one record per read in read-order.
   samtools view -F 0x904 -u "$aligned_sorted_bam" \
     | samtools sort -@ "$threads" -n -o "$primary_name_sorted_bam" -
   log "primary_bam     = $primary_name_sorted_bam"
@@ -299,6 +353,10 @@ main() {
   bash "$calc_stats_script" "$primary_name_sorted_bam"
 
   step "Polish reads with DualSiteDMSFilter"
+  # Read-level polishing: rewrites each read to the reference-implied sequence
+  # within the four DMS windows when quality/indel/library checks pass,
+  # emitting a polished FASTQ and a dual-UMI + variant-key TSV for the
+  # correlation stage.
   "$filter_binary" \
     "$primary_name_sorted_bam" \
     "$reference_fasta" \
@@ -311,6 +369,9 @@ main() {
   log "polished_fastq  = $output_fastq"
 
   step "Align polished reads"
+  # Re-align after polishing so CalcStats can re-measure residual error rate
+  # against the reference; coordinate-sorted output is fine here because
+  # this BAM is consumed only for stats, not by DualSiteDMSFilter.
   minimap2 -t "$threads" -ax map-ont "$reference_fasta" "$output_fastq" \
     | samtools view -u - \
     | samtools sort -@ "$threads" -o "$polished_aligned_bam" -

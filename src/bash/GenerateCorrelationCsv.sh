@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# GenerateCorrelationCsv.sh -- populates tables/correlation.csv for the thesis.
+# Reads a CSV template that lists one row per (model, filter-stage) along with
+# the per-row "variant_threshold" (single int or dash-separated list, e.g.
+# "1-2-5-10"). For each row, locates the matching *.variants.tsv produced by
+# DualSiteDMSFilter under <source_dir>, invokes VariantConcordance against
+# the single ground_truth=TRUE row (MGI UDP0057), and fills in eight metrics
+# per threshold (source/groundtruth/intersection/union variant counts plus
+# exact_overlap_mass, weighted_jaccard, jensen_shannon_similarity,
+# top100_spearman). Header order and row order are preserved; missing
+# threshold-suffixed metric columns are appended. Dependencies: awk, find,
+# sort, mktemp, and the project's VariantConcordance executable.
+
 usage() {
   cat >&2 <<'EOF'
 Usage:
@@ -40,37 +52,46 @@ Notes:
 EOF
 }
 
+# Print to stderr and exit 1. $*: message.
 die() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
 }
 
+# Timestamped info line to stderr (stdout is reserved for CSV emission).
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
 }
 
+# Die unless $1 is on PATH.
 require_command() {
   local command_name=$1
   command -v "$command_name" >/dev/null 2>&1 || die "Required command not found: $command_name"
 }
 
+# Die unless $1 is an existing regular file; $2 is a human label.
 require_file() {
   local path=$1
   local label=${2:-File}
   [[ -f "$path" ]] || die "$label does not exist: $path"
 }
 
+# Die unless $1 is an existing directory; $2 is a human label.
 require_directory() {
   local path=$1
   local label=${2:-Directory}
   [[ -d "$path" ]] || die "$label does not exist: $path"
 }
 
+# Strip a trailing CR so CSVs authored on Windows behave identically to
+# those authored on Unix. $1: raw string. Stdout: CR-stripped value.
 trim_cr() {
   local value=$1
   printf '%s' "${value%$'\r'}"
 }
 
+# Strip leading + trailing whitespace from $1; echo the trimmed value.
+# Uses parameter expansion only so it is safe on arbitrary bytes.
 trim_whitespace() {
   local value=$1
   value=${value#"${value%%[![:space:]]*}"}
@@ -78,11 +99,16 @@ trim_whitespace() {
   printf '%s' "$value"
 }
 
+# Upper-case $1 for case-insensitive comparison of the ground_truth column.
 to_upper() {
   local value=$1
   printf '%s' "$value" | tr '[:lower:]' '[:upper:]'
 }
 
+# Parse the per-row variant_threshold cell into a de-duplicated integer
+# array. Accepts a single int, dash/semicolon/colon-separated lists, and
+# empty (defaults to (1)). $1: raw cell text, $2: nameref to destination
+# array. Dies on any non-integer token.
 parse_threshold_list() {
   local raw_value=$1
   local -n destination=$2
@@ -100,6 +126,8 @@ parse_threshold_list() {
     return 0
   fi
 
+  # Collapse spaces and accept `;` or `:` as aliases for `-` so the
+  # user-facing spec is forgiving.
   normalized_value=${raw_value//[[:space:]]/}
   normalized_value=${normalized_value//;/-}
   normalized_value=${normalized_value//:/-}
@@ -111,6 +139,8 @@ parse_threshold_list() {
     [[ -n "$token" ]] || die "Invalid variant_threshold list: $raw_value"
     [[ "$token" =~ ^[0-9]+$ ]] || die "Invalid variant_threshold value: $token"
 
+    # 10# forces decimal interpretation so leading-zero tokens (e.g. "08")
+    # do not trip bash's octal parser.
     canonical_threshold=$((10#$token))
     token=$canonical_threshold
 
@@ -121,6 +151,9 @@ parse_threshold_list() {
   done
 }
 
+# Rename "haplotype" column families to "variant" so old templates work
+# unchanged against the current VariantConcordance metric set. $1: header
+# field; stdout: normalised field.
 normalize_legacy_header_field() {
   local field=$1
 
@@ -146,6 +179,9 @@ normalize_legacy_header_field() {
   esac
 }
 
+# Numeric-sort-unique a nameref'd array into a second nameref'd array.
+# $1: source array name, $2: destination array name. Used to produce a
+# stable, ascending global threshold order for header backfill.
 sort_unique_numeric_values() {
   local -n source_ref=$1
   local -n destination_ref=$2
@@ -156,6 +192,9 @@ sort_unique_numeric_values() {
   mapfile -t destination_ref < <(printf '%s\n' "${source_ref[@]}" | sort -n -u)
 }
 
+# Resolve the VariantConcordance binary: honour --concordance-bin, else
+# search PATH, else fall back to ../../build/VariantConcordance relative to
+# this script. Mirrors resolve_filter_binary() in DMSPolishing.sh.
 resolve_concordance_binary() {
   local requested_path=$1
   local script_directory
@@ -183,6 +222,10 @@ resolve_concordance_binary() {
   die "VariantConcordance was not found on PATH or under $project_root/build"
 }
 
+# Split a CSV line into a nameref'd array of exactly $2 cells, padding with
+# empty strings when the template row is short. The trailing "," trick
+# protects against `read -a` dropping a final empty field. $1: raw line,
+# $2: expected column count, $3: destination array name.
 parse_csv_line() {
   local line=$1
   local expected_columns=$2
@@ -199,6 +242,8 @@ parse_csv_line() {
   done
 }
 
+# Print a CSV row from a nameref'd array with commas between fields and a
+# trailing newline. No quoting (template values are plain).
 emit_csv_line() {
   local -n fields_ref=$1
   local field_count=${#fields_ref[@]}
@@ -213,6 +258,11 @@ emit_csv_line() {
   printf '\n'
 }
 
+# Find the single *.variants.tsv matching a CSV row name. Accepts either
+# `<stem>.variants.tsv` or `<stem>.<suffix>.variants.tsv` so per-threshold
+# / per-stage suffixes (e.g. `<stem>.t3.variants.tsv`) still resolve.
+# Errors on ambiguity (>1 match) or absence. $1: row name, $2: nameref
+# containing the full list of variant files under source_dir.
 resolve_variant_path() {
   local row_name=$1
   local -n variant_files_ref=$2
@@ -298,6 +348,9 @@ main() {
   local template_csv=${positional_args[0]}
   local source_dir=${positional_args[1]}
   local output_csv=${positional_args[2]}
+  # Order matches VariantConcordance's TSV output: fields[1..8] are pulled
+  # index-by-index into column <prefix>_<threshold>. Keep in sync with the
+  # assignments inside the per-threshold loop at the end of main().
   local metric_prefixes=(
     source_variants
     groundtruth_variants
@@ -324,6 +377,9 @@ main() {
   output_dir=$(dirname "$output_csv")
   mkdir -p "$output_dir"
 
+  # Write into a hidden sibling file of $output_csv then atomic-rename on
+  # success. %q is used so special characters in the path are safely
+  # embedded into the EXIT trap string.
   local temporary_output
   local cleanup_trap
   temporary_output=$(mktemp "$output_dir/.tmp.$(basename "$output_csv").XXXXXX")
@@ -341,6 +397,9 @@ main() {
   local header_count=${#header_fields[@]}
   (( header_count > 0 )) || die "Template CSV header is empty: $template_csv"
 
+  # Build column_index lookup after normalising any legacy "haplotype_*"
+  # column names. This keeps `column_index[source_variants_3]` valid even
+  # when the on-disk template still used the old "haplotype_" spelling.
   local -A column_index=()
   local index
   local normalized_header
@@ -362,6 +421,8 @@ main() {
 
   local name_index=${column_index[name]}
   local ground_truth_index=${column_index[ground_truth]}
+  # variant_threshold is optional; -1 sentinel means "assume threshold=1 for
+  # every row" per the documented default.
   local variant_threshold_index=-1
   if [[ -v "column_index[variant_threshold]" ]]; then
     variant_threshold_index=${column_index[variant_threshold]}
@@ -383,6 +444,10 @@ main() {
   local metric_prefix
   local metric_column_name
 
+  # First pass over data rows: cache the raw lines, collect every distinct
+  # threshold seen anywhere in the template (used to extend the header with
+  # <prefix>_<threshold> columns), and enforce exactly one ground_truth=TRUE
+  # row.
   while IFS= read -r row_line || [[ -n "$row_line" ]]; do
     row_line=$(trim_cr "$row_line")
     [[ -n "$row_line" ]] || continue
@@ -420,6 +485,8 @@ main() {
   (( ${#rows[@]} > 0 )) || die "Template CSV has no data rows: $template_csv"
   (( ground_truth_count == 1 )) || die "Template CSV must contain exactly one ground_truth=TRUE row (found $ground_truth_count)"
 
+  # Extend header with <prefix>_<threshold> columns for any thresholds not
+  # already present. Ascending threshold order yields a stable schema.
   sort_unique_numeric_values all_thresholds sorted_thresholds
   for threshold in "${sorted_thresholds[@]}"; do
     for metric_prefix in "${metric_prefixes[@]}"; do
@@ -432,6 +499,8 @@ main() {
   done
   header_count=${#header_fields[@]}
 
+  # Walk <source_dir> once with null-delimited find -print0 so the
+  # file-name list is robust to spaces/newlines; reused for every row.
   local variant_files=()
   while IFS= read -r -d '' row_line; do
     variant_files+=("$row_line")
@@ -469,6 +538,9 @@ main() {
         die "VariantConcordance failed for row \"$row_name\" at threshold $threshold"
       fi
 
+      # VariantConcordance writes a header line then a single tab-separated
+      # metrics line; pick NR==2. Expect 9 fields: [0] is threshold echo,
+      # [1..8] are the metrics in metric_prefixes order.
       metrics_line=$(printf '%s\n' "$concordance_output" | awk 'NR == 2 { print; exit }')
       [[ -n "$metrics_line" ]] || die "VariantConcordance did not return a metrics row for \"$row_name\" at threshold $threshold"
 
@@ -488,6 +560,7 @@ main() {
     emit_csv_line parsed_row >>"$temporary_output"
   done
 
+  # Atomic rename; EXIT trap cleans up temp if we die before this point.
   mv -f -- "$temporary_output" "$output_csv"
   log "Wrote completed correlation CSV to $output_csv"
 }

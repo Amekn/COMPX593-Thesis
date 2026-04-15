@@ -1,3 +1,12 @@
+// UmiSpliter.cpp
+// Produces executable: UmiSpliter
+// Usage: UmiSpliter <dual_umi.fastq> <umi1.fastq> <umi2.fastq>
+//
+// Pipeline role: split a dual-UMI FASTQ (headers carry ":UMI_<fwd>_<rev>")
+// into two single-UMI FASTQs so downstream single-UMI tools (UmiFilter,
+// SingleUmiOverlap) can work on either end independently. Also reports
+// distinct/duplicate/singleton counts for the dual key and each half so the
+// dual-UMI complexity of the library can be audited.
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -7,6 +16,8 @@
 
 namespace {
 
+// Header decomposition: everything before the ':UMI_' tag, the two UMI
+// halves, and any trailing metadata after the second UMI.
 struct ParsedDualHeader {
     std::string prefix;
     std::string first_umi;
@@ -14,6 +25,8 @@ struct ParsedDualHeader {
     std::string suffix;
 };
 
+// Per-run counters plus three distinct / duplicate set pairs, one for the
+// combined dual key and one for each single-UMI half.
 struct UmiSplitStatistics {
     std::uint64_t total_reads = 0;
     std::uint64_t parsed_reads = 0;
@@ -27,12 +40,17 @@ struct UmiSplitStatistics {
     std::unordered_set<std::string> duplicated_second_umis;
 };
 
+// Print CLI contract to stderr.
 void PrintUsage(const char* program_name) {
     std::cerr
         << "Usage: " << program_name << " <dual_umi.fastq> <umi1.fastq> <umi2.fastq>\n\n"
         << "Split dual-UMI FASTQ records into two single-UMI FASTQ files.\n";
 }
 
+// Decompose a dual-UMI header into prefix/first/second/suffix. Returns false
+// when the ':UMI_' tag, the '_' separator, or either UMI half is missing.
+// The suffix preserves everything after the second UMI (e.g. strand tags
+// appended by earlier tools) so the rewritten single-UMI headers retain it.
 bool ParseDualUmiHeader(const std::string& header, ParsedDualHeader* parsed_header) {
     constexpr char kTag[] = ":UMI_";
     const std::size_t tag_position = header.find(kTag);
@@ -40,6 +58,8 @@ bool ParseDualUmiHeader(const std::string& header, ParsedDualHeader* parsed_head
         return false;
     }
 
+    // sizeof(kTag) - 1 drops the trailing NUL so we advance past ":UMI_"
+    // without including it.
     const std::size_t first_umi_begin = tag_position + sizeof(kTag) - 1U;
     const std::size_t separator = header.find('_', first_umi_begin);
     if (separator == std::string::npos) {
@@ -49,6 +69,8 @@ bool ParseDualUmiHeader(const std::string& header, ParsedDualHeader* parsed_head
     const std::size_t second_umi_begin = separator + 1U;
     std::size_t second_umi_end = header.find_first_of(" \t\r\n", second_umi_begin);
     if (second_umi_end == std::string::npos) {
+        // No whitespace: the UMI runs to the end of the header and there
+        // is no suffix to preserve.
         second_umi_end = header.size();
         parsed_header->suffix.clear();
     } else {
@@ -61,6 +83,9 @@ bool ParseDualUmiHeader(const std::string& header, ParsedDualHeader* parsed_head
     return !parsed_header->first_umi.empty() && !parsed_header->second_umi.empty();
 }
 
+// Update the distinct/duplicate sets for the combined dual key and each
+// single-UMI half. A key enters the "duplicated" set only once the second
+// observation lands; the singleton count is then distinct - duplicated.
 void TrackUniqueness(UmiSplitStatistics* statistics, const ParsedDualHeader& parsed_header) {
     const std::string dual_key = parsed_header.first_umi + "_" + parsed_header.second_umi;
     if (!statistics->distinct_dual_keys.insert(dual_key).second) {
@@ -87,6 +112,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ~4M buckets for each of the six sets: the dual-UMI space is sparse
+    // relative to read count so distinct key cardinality tracks the library
+    // complexity, which for this project sits well below 4M.
     UmiSplitStatistics statistics;
     statistics.distinct_dual_keys.reserve(1U << 22);
     statistics.duplicated_dual_keys.reserve(1U << 22);
@@ -112,6 +140,8 @@ int main(int argc, char** argv) {
 
             TrackUniqueness(&statistics, parsed_header);
 
+            // Reuse the input sequence/quality/plus_line in both outputs
+            // and rewrite only the header to carry a single UMI each.
             ont::fastq::Record first_record = input_record;
             ont::fastq::Record second_record = input_record;
             first_record.header =
@@ -128,6 +158,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Singletons = distinct - duplicated. duplicated_* holds only keys
+    // that were seen >1 time, so this is arithmetic rather than a separate
+    // scan over the distinct set.
     const std::uint64_t singleton_dual_keys =
         statistics.distinct_dual_keys.size() - statistics.duplicated_dual_keys.size();
     const std::uint64_t singleton_first_umis =

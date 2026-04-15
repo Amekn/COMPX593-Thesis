@@ -1,3 +1,12 @@
+// MQAAR.cpp
+// Produces executable: MQAAR
+// Usage: MQAAR <report.tsv> [--convert]
+//
+// Pipeline role: read a Dorado/Bonito sequencing_summary TSV and compute the
+// arithmetic mean of 'mean_qscore_template'. With --convert the mean Phred
+// score is reported as accuracy percentage via (1 - 10^(-Q/10)) * 100, which
+// is the form used in the thesis basecaller-comparison tables. MQAAR stands
+// for "Mean Q-score to Approximate Accuracy Reporter".
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -9,6 +18,7 @@
 
 using namespace std;
 
+// Print CLI contract to stderr.
 static void usage(const char* prog) {
     cerr << "Usage: " << prog << " <report.tsv> [--convert]\n\n"
          <<
@@ -22,6 +32,9 @@ Options:
 )";
 }
 
+// Resolve the 0-based index of a named TSV column by scanning the header
+// row. Returns -1 if no column matches; the caller treats that as a fatal
+// configuration error rather than silently picking the wrong column.
 static int find_column_index(const string& header, const string& wanted) {
     string token;
     stringstream ss(header);
@@ -33,6 +46,9 @@ static int find_column_index(const string& header, const string& wanted) {
     return -1;
 }
 
+// Extract the value at column_index from a tab-separated line into out.
+// Returns false if the line has fewer columns than expected (short row),
+// in which case the caller skips it rather than aborting the scan.
 static bool read_column_value(const string& line, int column_index, string& out) {
     out.clear();
     string token;
@@ -93,6 +109,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Accumulate in long double to keep precision stable over millions of
+    // reads; stod-failed or partially-parsed fields are skipped silently so
+    // a handful of malformed rows do not abort the pass.
     long double sum = 0.0;
     uint64_t count = 0;
     string line;
@@ -119,6 +138,8 @@ int main(int argc, char** argv) {
     double mean_q = static_cast<double>(sum / static_cast<long double>(count));
     cout << fixed << setprecision(2);
     if (convert) {
+        // Phred-to-accuracy conversion; note this is the naive per-base
+        // accuracy derived from the mean Q, not the geometric mean.
         double mean_pct = (1.0 - std::pow(10.0, -mean_q / 10.0)) * 100.0;
         cout << "Mean accuracy percentage based on mean Q-score (" << mean_q << "): "
              << mean_pct << "%\n";

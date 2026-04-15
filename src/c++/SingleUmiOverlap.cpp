@@ -1,3 +1,11 @@
+// SingleUmiOverlap.cpp
+// Produces executable: SingleUmiOverlap
+// Usage: SingleUmiOverlap <fastq1> <fastq2>
+//
+// Pipeline role: quantify how nanopore vs MGI single-UMI populations overlap
+// after UmiSpliter has separated a dual-UMI FASTQ into its two single-UMI
+// halves. Reports both read-level matches and unique-key overlap so a per-
+// UMI sequencing-depth comparison can be derived.
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -8,17 +16,22 @@
 
 namespace {
 
+// Print CLI contract to stderr when argv count does not match.
 void PrintUsage(const char* program_name) {
     std::cerr
         << "Usage: " << program_name << " <fastq1> <fastq2>\n\n"
         << "Summarise read-level and unique-key overlap between two single-UMI FASTQ files.\n";
 }
 
+// Per-file tally used to build first-file vs second-file comparisons.
 struct OverlapSummary {
     std::uint64_t read_count = 0;
     std::unordered_set<std::string> umi_keys;
 };
 
+// Load a single-UMI FASTQ and collect read count plus the distinct UMI set.
+// The 3M bucket reserve and 0.70 load factor are tuned for MGI libraries
+// whose deduplicated UMI cardinality sits in the low millions.
 OverlapSummary LoadSingleUmiFile(const std::string& fastq_path) {
     OverlapSummary summary;
     summary.umi_keys.reserve(3'000'000);
@@ -49,6 +62,10 @@ int main(int argc, char** argv) {
         const OverlapSummary first_summary = LoadSingleUmiFile(argv[1]);
         const OverlapSummary second_summary = LoadSingleUmiFile(argv[2]);
 
+        // Replay the second file so we can count per-read matches (each
+        // record, not just each distinct key) against the first file's
+        // UMI set, while still classifying distinct keys as overlap vs
+        // second-only on first observation.
         std::unordered_set<std::string> seen_in_second_file;
         seen_in_second_file.reserve(3'000'000);
         seen_in_second_file.max_load_factor(0.70F);
@@ -68,6 +85,8 @@ int main(int argc, char** argv) {
                 ++overlapping_reads_in_second_file;
             }
 
+            // Only classify a UMI as overlap/second-only once, on the
+            // first time we see it in the second file.
             if (seen_in_second_file.insert(umi_key).second) {
                 if (present_in_first_file) {
                     ++overlapping_unique_umis;
@@ -77,6 +96,9 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Guard against arithmetic underflow if the first file somehow
+        // reports fewer keys than the overlap count (should not happen
+        // with well-formed input but cheap to defend).
         const std::uint64_t first_only_unique_umis =
             first_summary.umi_keys.size() >= overlapping_unique_umis
                 ? first_summary.umi_keys.size() - overlapping_unique_umis

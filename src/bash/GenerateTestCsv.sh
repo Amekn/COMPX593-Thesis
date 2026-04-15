@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# GenerateTestCsv.sh -- builds tables/test.csv, the thesis' per-model
+# benchmarking table. Each row in the template represents either (a) a
+# Dorado model to basecall with (Alpha/Beta/Gamma fine-tunes and the
+# stock "sup"), or (b) an existing FASTQ to feed straight into the polish
+# pipeline. For each row the script runs: basecall (or passthrough) ->
+# fastplong length filter -> minimap2 + primary extraction -> CalcStats
+# primary metrics -> DualSiteDMSFilter polish + variant TSV -> minimap2
+# on the polished FASTQ -> CalcStats polished metrics. All per-row
+# metrics are aggregated into a single JSON then projected into CSV cells
+# that match the template header. Rows already complete in the template
+# are skipped; failed rows are recorded but do not abort the run.
+#
+# Inputs: <template_csv> <source_dir> <test_input (POD5)> <output_csv>.
+# Outputs: <output_csv>, <output_csv>.failed.txt, plus a work/ tree of
+# per-row artifacts. Dependencies: dorado, fastplong, minimap2, samtools,
+# python3, tee, awk, and the project's DualSiteDMSFilter binary.
+
+# Baked-in thesis-host paths for the Fc reference FASTA and the DMS zone
+# descriptor; overridable at the CLI. These live on the workstation's
+# NAS mount so every model run sees the same ground truth.
 readonly DEFAULT_REFERENCE='/mnt/experimental/ont/source_data/fc_reference.fa'
 readonly DEFAULT_ZONES='/mnt/experimental/ont/source_data/DMSZones.txt'
 
@@ -46,38 +66,48 @@ Options:
 EOF
 }
 
+# Error to stderr then exit 1.
 die() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
 }
 
+# Timestamped progress line on stderr.
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
 }
 
+# Die unless $1 is on PATH.
 require_command() {
   local command_name=$1
   command -v "$command_name" >/dev/null 2>&1 || die "Required command not found: $command_name"
 }
 
+# Assert $1 is an existing file; $2 is human label text.
 require_file() {
   local path=$1
   local label=${2:-File}
   [[ -f "$path" ]] || die "$label does not exist: $path"
 }
 
+# Assert $1 is an existing directory; $2 is human label text.
 require_directory() {
   local path=$1
   local label=${2:-Directory}
   [[ -d "$path" ]] || die "$label does not exist: $path"
 }
 
+# Assert $1 exists (file or directory); $2 is label text. Used for --test
+# inputs that may be a single POD5 file or a POD5 directory.
 require_path() {
   local path=$1
   local label=${2:-Path}
   [[ -e "$path" ]] || die "$label does not exist: $path"
 }
 
+# Replace any byte outside [A-Za-z0-9._-] with _, falling back to "row"
+# when the entire component maps to nothing. Keeps per-row directory
+# names safe to embed in shell paths.
 sanitize_filename_component() {
   local value=$1
   value=$(printf '%s' "$value" | sed 's/[^A-Za-z0-9._-]/_/g')
@@ -85,6 +115,9 @@ sanitize_filename_component() {
   printf '%s\n' "$value"
 }
 
+# Strip all supported extensions from a dataset filename to produce a
+# stable stem. Shared with GenerateDataCsv.sh by convention; kept
+# private here to avoid coupling.
 dataset_stem_from_name() {
   local dataset_name=$1
   local stem=${dataset_name##*/}
@@ -97,21 +130,28 @@ dataset_stem_from_name() {
   printf '%s\n' "$stem"
 }
 
+# Sidecar .ok marker signalling "this FASTQ already validated structurally
+# once; no need to re-read every record".
 fastq_marker_path() {
   local fastq_path=$1
   printf '%s.ok\n' "$fastq_path"
 }
 
+# Drop an empty .ok marker next to a FASTQ to record it as valid.
 mark_fastq_valid() {
   local fastq_path=$1
   : >"$(fastq_marker_path "$fastq_path")"
 }
 
+# Remove both the FASTQ and its .ok marker before regeneration.
 clear_fastq_state() {
   local fastq_path=$1
   rm -f -- "$fastq_path" "$(fastq_marker_path "$fastq_path")"
 }
 
+# Structurally validate a FASTQ (gz or plain) and print the record count
+# on success. Errors out with a descriptive message on any malformed
+# record (wrong line count, missing @/+, sequence/quality length drift).
 fastq_read_count() {
   local fastq_path=$1
 
@@ -161,16 +201,22 @@ print(record_count)
 PY
 }
 
+# Thin wrapper: validate structurally, discard the count. Returns 0 iff
+# the FASTQ is well-formed.
 validate_fastq_file() {
   local fastq_path=$1
   fastq_read_count "$fastq_path" >/dev/null
 }
 
+# Total records in $1 (including unmapped / secondary / supplementary).
 bam_record_count() {
   local bam_path=$1
   samtools view -c "$bam_path"
 }
 
+# Safety check: the FASTQ derived from a primary BAM should have exactly
+# as many reads as the BAM has records (we do not emit secondary reads).
+# A mismatch almost always means an interrupted samtools fastq run.
 alignment_fastq_matches_bam() {
   local bam_path=$1
   local fastq_path=$2
@@ -188,6 +234,8 @@ alignment_fastq_matches_bam() {
   return 0
 }
 
+# Same resume gate as GenerateDataCsv.sh: reuse $1 when present, not
+# forced, and either marked valid or freshly structurally valid.
 reuse_fastq_if_valid() {
   local fastq_path=$1
   local force=$2
@@ -207,11 +255,16 @@ reuse_fastq_if_valid() {
   return 1
 }
 
+# Delegate to `samtools quickcheck`: fast structural sanity scan (magic
+# bytes + EOF marker) without a full scan of records.
 validate_bam_file() {
   local bam_path=$1
   samtools quickcheck "$bam_path"
 }
 
+# Read the first meaningful (non-blank, non-'#'-comment) line of the DMS
+# zone file. That line is the zone descriptor string consumed by
+# DualSiteDMSFilter.
 read_zone_string() {
   local zone_file=$1
   awk '
@@ -221,6 +274,9 @@ read_zone_string() {
   ' "$zone_file"
 }
 
+# Resolve the DualSiteDMSFilter binary: prefer --filter-bin override, then
+# PATH, then ../../build/DualSiteDMSFilter relative to this script. Mirrors
+# the same helper in DMSPolishing.sh.
 resolve_filter_binary() {
   local requested_path=$1
   local script_directory
@@ -248,6 +304,9 @@ resolve_filter_binary() {
   die "DualSiteDMSFilter was not found on PATH or under $project_root/build"
 }
 
+# Emit a zeroed-out JSON payload with the same keys that a real FASTQ
+# metrics block would carry, keyed by $prefix (e.g. "pre_length_filter_").
+# Used for stages that were skipped so the merged JSON is schema-stable.
 json_zero_fastq_metrics() {
   local prefix=$1
   python3 - "$prefix" <<'PY'
@@ -276,6 +335,10 @@ json.dump(payload, sys.stdout, sort_keys=True)
 PY
 }
 
+# Compute the full 15-key FASTQ metrics payload for $1 (plain or .gz) as
+# JSON, keyed by $2 prefix so the same helper can report pre_length_filter_,
+# post_length_filter_, post_alignment_filter_, post_dms_filter_ etc. into
+# the same merged JSON.
 compute_fastq_metrics_json() {
   local fastq_path=$1
   local prefix=$2
@@ -450,6 +513,9 @@ json.dump(payload, sys.stdout, sort_keys=True)
 PY
 }
 
+# Zero-valued alignment-metrics payload keyed by $prefix. Shape matches
+# compute_alignment_metrics_json(): I/D/mismatches/bases_mapped and two
+# error rates.
 json_zero_alignment_metrics() {
   local prefix=$1
   python3 - "$prefix" <<'PY'
@@ -469,6 +535,12 @@ json.dump(payload, sys.stdout, sort_keys=True)
 PY
 }
 
+# Like CalcStats' metrics block but produces JSON keyed by $prefix. The
+# third arg $filter_primary=="1" triggers an inline `samtools view -F
+# 0x904` pass into a temp BAM so the polished BAM (which has been
+# coordinate-sorted and may still contain secondary alignments) is
+# measured on primary-only records for apples-to-apples comparison with
+# the primary BAM from the length-filter stage.
 compute_alignment_metrics_json() {
   local bam_path=$1
   local prefix=$2
@@ -600,6 +672,10 @@ finally:
 PY
 }
 
+# Zero-valued payload for the DualSiteDMSFilter metric block (fail counts,
+# pass-by-codon-count buckets, unique variants, per-zone mismatch totals
+# and rates). Used when the DMS log is absent (e.g. polish was skipped
+# because the primary BAM was empty).
 json_zero_dms_metrics() {
   python3 - <<'PY'
 import json
@@ -637,6 +713,11 @@ json.dump(payload, sys.stdout, sort_keys=True)
 PY
 }
 
+# Parse the `[DmsFilterCount]` INI-style block DualSiteDMSFilter writes
+# to its log and emit a matching JSON payload. Keys are remapped from
+# the tool's internal "fail_*"/raw labels to the CSV-facing
+# "failed_*"/metric names (see the key_map literal inside the Python).
+# Dies if the section header is absent.
 parse_dms_filter_log_json() {
   local log_path=$1
 
@@ -738,6 +819,10 @@ json.dump(payload, sys.stdout, sort_keys=True)
 PY
 }
 
+# Merge a list of JSON files (keys disjoint by construction) into a
+# single flat object on stdout, and derive `pipeline_pass_rate` as
+# post_dms_filter_reads / pre_length_filter_reads (0 when input is 0).
+# This is the single column that crosses stages.
 merge_json_files() {
   python3 - "$@" <<'PY'
 import json
@@ -760,6 +845,10 @@ json.dump(merged, sys.stdout, sort_keys=True)
 PY
 }
 
+# Emit one `<row_index>\t<name>\t<complete 0|1>` TSV line per data row of
+# the template, so main() can decide per-row whether to process, skip, or
+# leave a fully-populated row untouched. row_index is 1-based and matches
+# the results_dir/<index>.json filenames used downstream.
 emit_template_row_metadata() {
   local template_csv=$1
   python3 - "$template_csv" <<'PY'
@@ -792,6 +881,11 @@ with path.open(newline="") as handle:
 PY
 }
 
+# Project per-row metric JSONs into the final CSV while preserving the
+# template's header and row order. For each data row, look up results_dir/
+# <row_index>.json (if any) and overwrite every template cell whose
+# column name appears as a key in the merged JSON. Appends the synthetic
+# `pipeline_pass_rate` column when the template does not already list it.
 render_output_csv() {
   local template_csv=$1
   local results_dir=$2
@@ -843,6 +937,12 @@ with template_csv.open(newline="") as in_handle, output_csv.open("w", newline=""
 PY
 }
 
+# Given a directory that looked like a candidate model (from the row-name
+# search), return the actual Dorado-ready model directory inside it.
+# Checks in order: the wrapper itself (if it has config.toml), a "_v2"
+# suffixed child (used by our fine-tunes), an exact-name child, then any
+# one lone child containing config.toml. Returns 1 on "no match", 2 on
+# ambiguity (caller propagates the status).
 resolve_model_dir_from_wrapper() {
   local wrapper_dir=$1
   local row_name=$2
@@ -866,6 +966,8 @@ resolve_model_dir_from_wrapper() {
     return 0
   fi
 
+  # Last resort: single-level child directory search for any sub-dir that
+  # holds its own config.toml (i.e. is a bona fide Bonito-export model).
   while IFS= read -r candidate; do
     candidates+=("$candidate")
   done < <(find "$wrapper_dir" -mindepth 1 -maxdepth 1 -type d -name '*' -exec test -f '{}/config.toml' ';' -print)
@@ -884,6 +986,14 @@ resolve_model_dir_from_wrapper() {
   return 2
 }
 
+# Classify a template row name as one of three source types and emit
+# "<type>\t<resolved_path>" on stdout:
+#   sup    -- literal row name "sup" -> invoke the built-in $SUP_MODEL
+#   model  -- directory containing a Dorado-ready model
+#   fastq  -- an already-basecalled FASTQ on disk
+# Preference order: exact-name match (file or model directory), then an
+# unambiguous stem-match FASTQ. Dies / returns non-zero on ambiguity so
+# the template must be unambiguous per row.
 resolve_row_source() {
   local row_name=$1
   local source_dir=$2
@@ -984,6 +1094,9 @@ resolve_row_source() {
   die "Could not resolve row '$row_name' under $source_dir"
 }
 
+# Invoke dorado to basecall $test_input (file or directory) with
+# $model_spec into $output_fastq. Retries once; as in GenerateDataCsv.sh,
+# a non-zero dorado exit is accepted when the FASTQ still validates.
 run_basecalling_if_needed() {
   local model_spec=$1
   local test_input=$2
@@ -997,6 +1110,9 @@ run_basecalling_if_needed() {
 
   mkdir -p "$(dirname "$output_fastq")"
 
+  # --emit-fastq skips the usual BAM emission; --trim all removes adapters
+  # and barcodes at basecalling time so fastplong can leave adapter
+  # trimming off. --recursive is added only for directory inputs.
   local dorado_args=(
     basecaller
     --emit-fastq
@@ -1028,6 +1144,8 @@ run_basecalling_if_needed() {
   return 1
 }
 
+# Length-only filter via fastplong (adapter + quality filtering disabled)
+# with HTML and JSON reports alongside. Retries once on failure.
 run_length_filter_if_needed() {
   local input_fastq=$1
   local output_fastq=$2
@@ -1073,6 +1191,11 @@ run_length_filter_if_needed() {
   return 1
 }
 
+# Align length-filtered reads with minimap2 (map-ont preset), drop
+# unmapped/secondary/supplementary via 0x904, name-sort the primaries,
+# and project back into a FASTQ. Also validates both BAMs and asserts
+# the FASTQ has the same record count as the primary BAM so downstream
+# stages cannot silently use a truncated projection.
 run_primary_alignment_if_needed() {
   local input_fastq=$1
   local reference_path=$2
@@ -1121,6 +1244,11 @@ run_primary_alignment_if_needed() {
   mark_fastq_valid "$aligned_fastq"
 }
 
+# Run DualSiteDMSFilter in polish mode: produces a polished FASTQ (writes
+# per-read reference-implied DMS windows), a variants TSV (consumed by
+# GenerateCorrelationCsv.sh), and a stdout/stderr log that we tee into
+# $dms_log. The [DmsFilterCount] block in that log is later parsed via
+# parse_dms_filter_log_json() for CSV columns.
 run_dms_filter_if_needed() {
   local primary_bam=$1
   local reference_path=$2
@@ -1163,6 +1291,10 @@ run_dms_filter_if_needed() {
   return 1
 }
 
+# Re-align the polished FASTQ and coordinate-sort so CalcStats can
+# re-measure residual error against the reference. Empty polished FASTQ
+# -> skip (no BAM emitted), so downstream code must tolerate a missing
+# $polished_bam.
 run_polished_alignment_if_needed() {
   local polished_fastq=$1
   local reference_path=$2
@@ -1184,6 +1316,8 @@ run_polished_alignment_if_needed() {
     return 0
   fi
 
+  # Coordinate-sorted, not name-sorted: polished BAM is only used for
+  # stats and CIGAR walking; no downstream tool requires read-order.
   log "Aligning polished FASTQ $polished_fastq -> $polished_bam"
   minimap2 -t "$threads" -ax map-ont "$reference_path" "$polished_fastq" \
     | samtools view -@ "$threads" -u - \
@@ -1192,6 +1326,11 @@ run_polished_alignment_if_needed() {
   validate_bam_file "$polished_bam"
 }
 
+# Compose all per-stage JSON payloads for one row, merge them, and stamp
+# the row's `name` field. Missing inputs fall back to the appropriate
+# json_zero_* helper so the merged payload always has the full schema.
+# $1 row_name, $2..$7 the various FASTQ/BAM inputs, $8 dms log,
+# $9 row dir (workspace), $10 output merged JSON.
 build_row_metrics_json() {
   local row_name=$1
   local base_fastq=$2
@@ -1244,6 +1383,8 @@ build_row_metrics_json() {
     json_zero_dms_metrics >"$dms_json"
   fi
 
+  # filter_primary=1 for the polished BAM (coord-sorted, may contain
+  # secondaries); primary BAM is already primary-only so we pass 0 above.
   if [[ -f "$polished_bam" ]]; then
     compute_alignment_metrics_json "$polished_bam" "polished_" 1 >"$polished_json"
   else
@@ -1273,6 +1414,12 @@ path.write_text(json.dumps(payload, sort_keys=True))
 PY
 }
 
+# Full pipeline for one template row. Resolves source, runs whichever of
+# (basecall/passthrough, length filter, alignment, polish, polish
+# alignment) are applicable, builds the metrics JSON, and atomic-renames
+# it into $metrics_json_path so a crash leaves the cached metrics intact.
+# Returns 1 if any mandatory stage fails, so main() can mark the row
+# failed without aborting the whole run.
 process_row() {
   local row_index=$1
   local row_name=$2
@@ -1298,6 +1445,8 @@ process_row() {
     return 0
   fi
 
+  # row_id is zero-padded then sanitised so the row's working directory
+  # name is filesystem-safe and shell-safe (Alpha_QCH+base -> Alpha_QCH_base).
   row_id=$(printf '%03d_%s' "$row_index" "$(sanitize_filename_component "$row_name")")
   row_dir="$WORK_ROOT/rows/$row_id"
   resolution_file="$row_dir/source_resolution.tsv"
@@ -1310,6 +1459,8 @@ process_row() {
   IFS=$'\t' read -r source_type resolved_path <"$resolution_file"
   log "Resolved row $row_name as $source_type: $resolved_path"
 
+  # model/sup rows basecall the thesis' POD5 test set; fastq rows skip
+  # basecalling entirely and feed the on-disk FASTQ into length filtering.
   case "$source_type" in
     model|sup)
       base_fastq="$row_dir/${row_id}.basecalled.fq"
@@ -1343,6 +1494,8 @@ process_row() {
     "$FORCE" \
     || return 1
 
+  # Empty length-filtered FASTQ -> skip alignment and polish; emit an empty
+  # aligned FASTQ so downstream helpers still have a file to look at.
   if [[ -s "$length_filtered_fastq" ]]; then
     run_primary_alignment_if_needed \
       "$length_filtered_fastq" \
@@ -1360,6 +1513,8 @@ process_row() {
     mark_fastq_valid "$aligned_fastq"
   fi
 
+  # Skip polishing when the primary BAM is missing (alignment was skipped)
+  # or the projected FASTQ is empty; keep the filesystem in a sane state.
   if [[ -f "$primary_bam" && -s "$aligned_fastq" ]]; then
     run_dms_filter_if_needed \
       "$primary_bam" \
@@ -1393,6 +1548,9 @@ process_row() {
     rm -f -- "$polished_bam"
   fi
 
+  # Build the merged metrics JSON into a temp file, then atomic-rename
+  # into the final cache path. A mid-run crash leaves the previous cache
+  # untouched instead of half-writing the final JSON.
   merged_metrics_tmp=$(mktemp "$row_dir/metrics.XXXXXX.json")
   build_row_metrics_json \
     "$row_name" \
@@ -1414,6 +1572,9 @@ process_row() {
 }
 
 main() {
+  # Defaults track the thesis pipeline: SQK-NBD114-24 kit, stock dorado
+  # "sup" for the baseline row, 600-800 bp window around the ~700 bp Fc
+  # amplicon, NNK codon library and <=3 indel events/bases for the polish.
   local template_csv=
   local source_dir=
   local test_input=
@@ -1549,6 +1710,9 @@ main() {
   (( threads > 0 )) || die "--threads must be greater than zero"
   (( max_length >= min_length )) || die "--max-length must be >= --min-length"
 
+  # Default work root: <output_csv sans .csv>.work; keeps row caches
+  # alongside the CSV they populate. Fallback to "<output_csv>.work" when
+  # the CSV path has no .csv suffix.
   if [[ -z "$work_root" ]]; then
     work_root=${output_csv%.csv}
     if [[ "$work_root" == "$output_csv" ]]; then
@@ -1560,6 +1724,9 @@ main() {
 
   mkdir -p "$work_root" "$(dirname "$output_csv")"
 
+  # All per-row work is driven by globals so process_row() can be called
+  # inside the row loop without threading eighteen positional args. These
+  # are effectively "main's locals exported for process_row's view".
   TEMPLATE_CSV=$template_csv
   SOURCE_DIR=$source_dir
   TEST_INPUT=$test_input
@@ -1601,6 +1768,9 @@ main() {
   log "Zone string       = $ZONE_STRING"
   log "Filter binary     = $FILTER_BINARY"
 
+  # Iterate template rows in order. Blank rows and already-complete rows
+  # are passed through unchanged (no JSON emitted); failures are logged
+  # but do not abort the run so a long sweep survives a single-row flake.
   while IFS=$'\t' read -r row_index row_name row_complete; do
     if [[ -z "$row_name" ]]; then
       rm -f -- "$results_dir/${row_index}.json"
@@ -1624,6 +1794,8 @@ main() {
     fi
   done < <(emit_template_row_metadata "$TEMPLATE_CSV")
 
+  # Atomic publish: render into a temp CSV, then mv into place so a reader
+  # never sees a partially written output file.
   output_tmp=$(mktemp "$WORK_ROOT/output.XXXXXX.csv")
   render_output_csv "$TEMPLATE_CSV" "$results_dir" "$output_tmp"
   mv -f -- "$output_tmp" "$OUTPUT_CSV"

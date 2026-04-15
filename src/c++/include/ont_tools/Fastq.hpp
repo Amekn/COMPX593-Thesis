@@ -1,3 +1,9 @@
+// Fastq.hpp
+// Minimal header-only FASTQ record type plus plain-stream Reader/Writer
+// helpers. The thesis pipeline is happy with uncompressed text FASTQ
+// (compression is handled externally by pigz/zcat), so the implementation
+// avoids any library dependency and delegates gzip/bgzf concerns to the
+// shell glue.
 #pragma once
 
 #include <fstream>
@@ -8,6 +14,8 @@
 
 namespace ont::fastq {
 
+// A single FASTQ record held as four line-strings; plus_line is kept verbatim
+// so round-trips preserve any tag appended after the '+'.
 struct Record {
     std::string header;
     std::string sequence;
@@ -15,12 +23,17 @@ struct Record {
     std::string quality;
 };
 
+// Strip a trailing '\r' so Windows-line-ending FASTQs parse cleanly.
 inline void TrimTrailingCarriageReturn(std::string* text) {
     if (!text->empty() && text->back() == '\r') {
         text->pop_back();
     }
 }
 
+// Read the next four-line FASTQ record from input into record. Returns false
+// at EOF on the first line. Throws std::runtime_error on any structural
+// failure (missing line, bad prefix, sequence/quality length mismatch);
+// source_name is embedded in the exception for diagnostic context.
 inline bool ReadRecord(std::istream& input, Record& record, const std::string& source_name = "FASTQ") {
     if (!std::getline(input, record.header)) {
         return false;
@@ -55,6 +68,8 @@ inline bool ReadRecord(std::istream& input, Record& record, const std::string& s
     return true;
 }
 
+// Owning FASTQ input handle. Constructor opens the file (throws on failure)
+// and retains the path so ReadRecord can surface it in error messages.
 class Reader {
 public:
     explicit Reader(const std::string& path) : path_(path), stream_(path) {
@@ -72,6 +87,8 @@ private:
     std::ifstream stream_;
 };
 
+// Owning FASTQ output handle. Writes records in canonical four-line form
+// with a trailing '\n' on each line; no buffering tweaks beyond std::ofstream.
 class Writer {
 public:
     explicit Writer(const std::string& path) : stream_(path) {

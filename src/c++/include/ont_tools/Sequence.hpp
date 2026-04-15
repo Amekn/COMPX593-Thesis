@@ -1,3 +1,9 @@
+// Sequence.hpp
+// Header-only nucleotide utilities: ASCII base handling, IUPAC bit-mask
+// lookup for ambiguity-aware matching, reverse-complement, and primer
+// search helpers. Designed for hot paths in PrimerTrimmer and the DMS
+// filter where every read calls these multiple times, so tables are built
+// once (Meyers singletons) and reused.
 #pragma once
 
 #include <algorithm>
@@ -10,10 +16,12 @@
 
 namespace ont::seq {
 
+// ASCII-safe uppercase that avoids std::toupper's signed-char UB.
 inline char ToUpper(char value) {
     return static_cast<char>(std::toupper(static_cast<unsigned char>(value)));
 }
 
+// True for A/C/G/T (case-insensitive); ambiguous IUPAC codes return false.
 inline bool IsCanonicalBase(char value) {
     const char base = ToUpper(value);
     return base == 'A' || base == 'C' || base == 'G' || base == 'T';
@@ -21,6 +29,9 @@ inline bool IsCanonicalBase(char value) {
 
 namespace detail {
 
+// 256-entry lookup keyed by ASCII code: each entry is a 4-bit mask over
+// {A=1, C=2, G=4, T=8} encoding which canonical bases an IUPAC code allows.
+// Built once lazily so repeated calls on the hot path are table lookups.
 inline const std::array<std::uint8_t, 256>& BaseMaskTable() {
     static const std::array<std::uint8_t, 256> table = [] {
         std::array<std::uint8_t, 256> masks{};
@@ -76,6 +87,9 @@ inline const std::array<std::uint8_t, 256>& BaseMaskTable() {
     return table;
 }
 
+// 256-entry IUPAC complement lookup. Unset entries default to 'N' so any
+// stray non-nucleotide byte reverse-complements to an unambiguous no-call
+// rather than silently returning 0.
 inline const std::array<char, 256>& ComplementTable() {
     static const std::array<char, 256> table = [] {
         std::array<char, 256> complements{};
@@ -115,31 +129,41 @@ inline const std::array<char, 256>& ComplementTable() {
 
 }  // namespace detail
 
+// Return the IUPAC base mask for a character (see BaseMaskTable).
 inline std::uint8_t BaseMask(char value) {
     return detail::BaseMaskTable()[static_cast<unsigned char>(value)];
 }
 
+// Return the IUPAC complement of a base. Unknown inputs map to 'N'.
 inline char Complement(char value) {
     return detail::ComplementTable()[static_cast<unsigned char>(value)];
 }
 
+// Uppercase a sequence, returning a new string. Used to normalise reads once
+// before a primer search instead of upper-casing on every compare.
 inline std::string ToUpperCopy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), ToUpper);
     return value;
 }
 
+// In-place uppercase variant; callers keep ownership of the buffer.
 inline void UppercaseInPlace(std::string* value) {
     std::transform(value->begin(), value->end(), value->begin(), ToUpper);
 }
 
+// Reverse a string without complementing - used to keep quality strings in
+// sync when a read is reverse-complemented.
 inline std::string ReverseCopy(std::string_view value) {
     return std::string(value.rbegin(), value.rend());
 }
 
+// Alias for ReverseCopy that documents intent at call sites.
 inline std::string ReverseQuality(std::string_view quality) {
     return ReverseCopy(quality);
 }
 
+// Return the reverse complement of a sequence. IUPAC ambiguous bases are
+// complemented via the lookup table (e.g. R<->Y, W<->W).
 inline std::string ReverseComplement(std::string_view sequence) {
     std::string reverse_complement;
     reverse_complement.reserve(sequence.size());
@@ -149,6 +173,9 @@ inline std::string ReverseComplement(std::string_view sequence) {
     return reverse_complement;
 }
 
+// List the 0-based offsets at which a primer carries an ambiguous IUPAC
+// code. Used by UMI extraction to know which bases in the aligned primer
+// should be collected as UMI payload vs. match check.
 inline std::vector<int> AmbiguousPositions(std::string_view primer) {
     std::vector<int> positions;
     positions.reserve(primer.size());
@@ -160,6 +187,9 @@ inline std::vector<int> AmbiguousPositions(std::string_view primer) {
     return positions;
 }
 
+// Pick the bases at the given indices out of sequence and concatenate them.
+// Out-of-range indices are silently skipped so a short read cannot abort
+// extraction mid-way.
 inline std::string ExtractIndexedBases(std::string_view sequence, const std::vector<int>& positions) {
     std::string result;
     result.reserve(positions.size());
@@ -171,6 +201,10 @@ inline std::string ExtractIndexedBases(std::string_view sequence, const std::vec
     return result;
 }
 
+// Check whether primer aligns to sequence at start_offset with at most
+// max_mismatches. IUPAC compatibility uses bit-wise AND of the two masks:
+// non-zero means at least one shared base, which is treated as a match.
+// Returns false early once the mismatch budget is exceeded.
 inline bool MatchesIupacWithMismatches(
     std::string_view sequence,
     const std::size_t start_offset,
@@ -194,6 +228,9 @@ inline bool MatchesIupacWithMismatches(
     return true;
 }
 
+// Scan left-to-right and return the first start offset where primer matches
+// sequence within the mismatch budget, or -1 if nothing fits. Used to locate
+// the forward primer at the 5' end of a nanopore read.
 inline int FindPrimerFromLeft(std::string_view sequence, std::string_view primer, int max_mismatches) {
     if (primer.size() > sequence.size()) {
         return -1;
@@ -208,6 +245,9 @@ inline int FindPrimerFromLeft(std::string_view sequence, std::string_view primer
     return -1;
 }
 
+// Scan right-to-left and return the right-most matching start offset, or -1
+// if the primer does not fit. Used to anchor the reverse-complement of the
+// reverse primer near the 3' end so the trimmed span brackets the insert.
 inline int FindPrimerFromRight(std::string_view sequence, std::string_view primer, int max_mismatches) {
     if (primer.size() > sequence.size()) {
         return -1;

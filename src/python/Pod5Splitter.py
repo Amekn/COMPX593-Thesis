@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Split a POD5 file into multiple outputs with balanced read counts."""
+"""Partition a POD5 file into N shards with near-equal read counts.
+
+Used in the COMPX593 thesis preprocessing stage to shard a large raw POD5
+so each shard can be basecalled in parallel on a separate GPU/worker. Reads
+are emitted in source order: the first ``k`` reads fill shard 0, the next
+``k`` fill shard 1, and so on, where shard sizes differ by at most one read
+when ``total_reads`` is not evenly divisible. Read records are copied
+verbatim; no metadata is rewritten.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +20,11 @@ import pod5 as p5
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    """Create the command-line interface for the POD5 splitter."""
+    """Create the CLI parser for the POD5 splitter.
+
+    Accepts the input POD5, the requested shard count, the output directory,
+    and a filename prefix used to build deterministic shard names.
+    """
     parser = argparse.ArgumentParser(
         description="Split one POD5 file into multiple POD5 outputs with near-equal read counts."
     )
@@ -24,7 +36,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def build_output_paths(output_directory: Path, output_prefix: str, output_count: int) -> list[Path]:
-    """Construct deterministic output filenames for all split files."""
+    """Construct deterministic shard filenames of the form ``<prefix>.partNNNN.pod5``.
+
+    The four-digit ``%04d`` index provides lexicographic ordering that
+    matches numeric ordering for up to 9999 shards, which is far beyond any
+    realistic parallel-basecall batch.
+    """
     return [
         output_directory / f"{output_prefix}.part{output_index + 1:04d}.pod5"
         for output_index in range(output_count)
@@ -32,7 +49,11 @@ def build_output_paths(output_directory: Path, output_prefix: str, output_count:
 
 
 def compute_partition_sizes(total_reads: int, output_count: int) -> list[int]:
-    """Distribute reads as evenly as possible across the requested number of outputs."""
+    """Return shard sizes summing to ``total_reads`` and differing by at most one.
+
+    The first ``remainder`` shards receive an extra read, matching the
+    classic "ceil for the first r, floor for the rest" balanced-split rule.
+    """
     base_size, remainder = divmod(total_reads, output_count)
     return [
         base_size + (1 if output_index < remainder else 0)
@@ -41,7 +62,13 @@ def compute_partition_sizes(total_reads: int, output_count: int) -> list[int]:
 
 
 def validate_arguments(source_path: Path, output_paths: Sequence[Path], output_count: int) -> None:
-    """Validate the requested split before any output files are created."""
+    """Check the requested split before any shard file is opened for writing.
+
+    Raises:
+        FileNotFoundError: If the source POD5 is missing.
+        ValueError: If the source extension is wrong or ``output_count <= 0``.
+        FileExistsError: If any proposed shard path already exists.
+    """
     if not source_path.exists():
         raise FileNotFoundError(f"Input file not found: {source_path}")
     if source_path.suffix.lower() != ".pod5":
@@ -54,7 +81,24 @@ def validate_arguments(source_path: Path, output_paths: Sequence[Path], output_c
 
 
 def split_pod5(source_path: Path, output_paths: Sequence[Path]) -> list[int]:
-    """Write balanced POD5 splits and return the number of reads written to each output file."""
+    """Stream the source POD5 into the prepared shard writers.
+
+    Opens all writers up front through a single ``ExitStack`` so every shard
+    is flushed and closed even when a mid-stream error occurs. Reads are
+    distributed contiguously: shard ``i`` receives the ``i``-th contiguous
+    block of ``target_sizes[i]`` reads in source-file order.
+
+    Args:
+        source_path: POD5 file to partition.
+        output_paths: Pre-computed shard destination paths.
+
+    Returns:
+        List of per-shard read counts in the same order as ``output_paths``.
+
+    Raises:
+        RuntimeError: If the source POD5 has no reads.
+        ValueError: If more shards were requested than there are reads.
+    """
     with ExitStack() as stack:
         reader = stack.enter_context(p5.Reader(str(source_path)))
         total_reads = int(reader.num_reads)
@@ -70,6 +114,10 @@ def split_pod5(source_path: Path, output_paths: Sequence[Path]) -> list[int]:
         writers = [stack.enter_context(p5.Writer(str(output_path))) for output_path in output_paths]
         written_counts = [0 for _ in output_paths]
 
+        # Rolling cursor: we advance ``current_writer_index`` only when the
+        # current shard has received exactly its target size, which keeps
+        # reads contiguous within each shard (simplifies cross-referencing
+        # against the original file when debugging a specific basecall).
         current_writer_index = 0
         reads_written_to_current_output = 0
 
@@ -81,6 +129,8 @@ def split_pod5(source_path: Path, output_paths: Sequence[Path]) -> list[int]:
             if reads_written_to_current_output == target_sizes[current_writer_index]:
                 current_writer_index += 1
                 reads_written_to_current_output = 0
+                # Break early: any reads remaining in the source beyond the
+                # planned total would overflow past the last shard.
                 if current_writer_index == len(writers):
                     break
 
@@ -88,7 +138,11 @@ def split_pod5(source_path: Path, output_paths: Sequence[Path]) -> list[int]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the command-line entry point."""
+    """CLI entry point: resolve paths, validate, split, and print counts.
+
+    On success prints one ``<path>\\t<count>`` line per shard to stdout so
+    the tab-separated output composes with shell pipelines.
+    """
     arguments = build_argument_parser().parse_args(argv)
 
     source_path = arguments.source_pod5.resolve()

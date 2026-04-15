@@ -1,3 +1,12 @@
+// UmiCloner.cpp
+// Produces executable: UmiCloner
+// Usage: UmiCloner <umi_fastq> <source_fastq> <destination_fastq>
+//
+// Pipeline role: transfer the UMI-annotated headers from one FASTQ onto the
+// matching reads of a second, unannotated FASTQ (e.g. lift nanopore UMIs
+// onto a re-basecalled pass of the same pod5 reads). Matching is performed
+// on the bare read name with any ':UMI_...' suffix stripped, so a second
+// basecall of the same pod5 library inherits the first pass's dual UMIs.
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -8,6 +17,7 @@
 
 namespace {
 
+// Print the CLI contract to stderr when argv count does not match.
 void PrintUsage(const char* program_name) {
     std::cerr
         << "Usage: " << program_name << " <umi_fastq> <source_fastq> <destination_fastq>\n\n"
@@ -30,6 +40,9 @@ int main(int argc, char** argv) {
     const std::string source_fastq = argv[2];
     const std::string destination_fastq = argv[3];
 
+    // Reserve ~16M buckets (1<<24): the UMI FASTQ is typically the full
+    // basecalled dataset, so pre-sizing the read-name -> header map avoids
+    // repeated rehashing during the first pass.
     std::unordered_map<std::string, std::string> umi_header_by_read_name;
     umi_header_by_read_name.reserve(1U << 24);
 
@@ -40,6 +53,8 @@ int main(int argc, char** argv) {
     std::uint64_t unmatched_records = 0;
 
     try {
+        // First pass: index the UMI FASTQ by bare read name. The first
+        // header wins on collision; later collisions are only counted.
         ont::fastq::Reader umi_reader(umi_fastq);
         ont::fastq::Record record;
         while (umi_reader.Next(record)) {
@@ -51,6 +66,9 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Second pass: stream the source FASTQ, swap each matching record's
+        // header for the UMI-bearing one, and emit. Unmatched reads are
+        // dropped rather than passed through unannotated.
         ont::fastq::Reader source_reader(source_fastq);
         ont::fastq::Writer destination_writer(destination_fastq);
 
@@ -64,6 +82,8 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            // Keep sequence and quality from the source, replace only the
+            // header so the record now carries the cloned UMI tag.
             ont::fastq::Record output_record = source_record;
             output_record.header = match->second;
             destination_writer.Write(output_record);

@@ -1,3 +1,30 @@
+// DualSiteDMSFilter: flagship thesis tool.
+//
+// Produces the `DualSiteDMSFilter` executable. Reads a minimap2/htslib BAM of
+// nanopore basecalls aligned to a single-contig amplicon reference, walks each
+// read's CIGAR to reconstruct a reference-length "corrected" sequence, and
+// emits two outputs:
+//
+//   1. A FASTQ (<out.fastq>) of reference-length polished reads. Bases inside
+//      the user-supplied DMS zones are taken from the read (iff they pass
+//      --min-bq); bases outside those zones are forced to the reference
+//      ("WT") and stamped with the --wt-q phred quality. This is the input
+//      consumed by the Benchmarker family of tools for accuracy evaluation.
+//   2. Optionally, a TSV (--out-counts) of variant_key -> count pairs. The
+//      variant_key is a sorted, ';'-joined list of "<pos><ref>>::<alt>" edits
+//      within DMS zones ("WT" when no passing edits exist); this is the input
+//      consumed by VariantConcordance.
+//
+// Core filters (in order): mapping flags (drop unmapped/secondary/supplementary
+// and --min-mapq), CIGAR indel budget, zone coverage (full coverage of first+
+// last DMS zone, or --require-all-zones for every zone), at most two mutated
+// DMS codons per read ("dual-site" rule), and optional NNK codon validation
+// (3rd base must be G or T; see --mut-codon-library NNK).
+//
+// Also accumulates per-region mismatch rates (DMS vs. framework / WT noise),
+// per-base and per-codon, for stderr reporting. Framework noise is measured
+// from the raw aligned bases outside DMS zones (not from the corrected_seq,
+// which is forced WT there).
 #include <htslib/sam.h>
 #include <htslib/faidx.h>
 #include <algorithm>
@@ -15,24 +42,32 @@
 #include <vector>
 #include <iomanip>
 
-// Define a mutational zone range with bases at the ends included
+// 1-based inclusive reference interval describing one DMS mutation window.
+// The thesis amplicon uses four zones (40-75, 211-243, 439-459, 577-627).
 struct Zone {
     int32_t start; // 1-based inclusive
     int32_t end;   // 1-based inclusive
 };
 
+// Codon library design constraint applied to every mutated codon inside DMS
+// zones. NNN accepts any codon; NNK (the thesis phage-display library design)
+// additionally requires the 3rd base to be G or T.
 enum class MutantCodonLibrary {
     NNN,
     NNK
 };
 
-// Convert all nucleotides to upper case
+// Convert all nucleotides to upper case. In-place via the value parameter; the
+// unsigned-char cast avoids UB on signed chars with the high bit set.
 static inline std::string to_upper(std::string s) {
     for (char &c : s) c = (char)std::toupper((unsigned char)c);
     return s;
 }
 
 // Parse the continuous zones literal (e.g., 11-40,50-80,90-130) into a vector of zones.
+// Zones are sorted by start for deterministic first_zone/last_zone semantics.
+// Returns false on any malformed token (missing dash, non-positive bounds,
+// reversed range, or empty input) without touching `zones` beyond clearing it.
 static bool parse_zones(const std::string& s, std::vector<Zone>& zones) {
     zones.clear();
     std::stringstream ss(s);
@@ -55,6 +90,9 @@ static bool parse_zones(const std::string& s, std::vector<Zone>& zones) {
     return true;
 }
 
+// Decode the 4-bit packed base at 0-based read offset `read_i0` from a BAM
+// record. The `nt` lookup is htslib's standard IUPAC table indexed by the
+// nibble value returned by bam_seqi.
 static inline char bam_base(const bam1_t* b, int32_t read_i0) {
     static const char* nt = "=ACMGRSVTWYHKDBN";
     uint8_t* seq = bam_get_seq(b);
@@ -62,12 +100,18 @@ static inline char bam_base(const bam1_t* b, int32_t read_i0) {
     return (char)std::toupper((unsigned char)c);
 }
 
+// Raw (non phred33-shifted) base quality at read offset `read_i0`. 255 is the
+// htslib sentinel for "no quality recorded"; we coerce to 0 so downstream
+// thresholds treat it as the lowest possible quality.
 static inline uint8_t bam_qual_raw(const bam1_t* b, int32_t read_i0) {
     uint8_t q = bam_get_qual(b)[read_i0];
     if (q == 255) q = 0; // treat missing as 0
     return q;
 }
 
+// Join a sorted list of "<pos><ref>><alt>" edit tokens into the variant key
+// format consumed by VariantConcordance. An empty edit list (no DMS-zone
+// deviations after filtering) is encoded as the literal string "WT".
 static std::string join_edits(const std::vector<std::string>& edits) {
     if (edits.empty()) return "WT";
     std::string out;
@@ -79,6 +123,8 @@ static std::string join_edits(const std::vector<std::string>& edits) {
     return out;
 }
 
+// Parse the --mut-codon-library string into the enum. Returns false on
+// anything other than "NNN" or "NNK" (case-insensitive).
 static bool parse_mutant_codon_library(const std::string& s, MutantCodonLibrary& out) {
     std::string u = to_upper(s);
     if (u == "NNN") {
@@ -92,6 +138,8 @@ static bool parse_mutant_codon_library(const std::string& s, MutantCodonLibrary&
     return false;
 }
 
+// Pretty-printer used only in the stderr summary; keeps the log lines
+// self-describing without needing to remember the enum value.
 static const char* mutant_codon_library_name(MutantCodonLibrary lib) {
     switch (lib) {
         case MutantCodonLibrary::NNN: return "NNN";
@@ -100,6 +148,8 @@ static const char* mutant_codon_library_name(MutantCodonLibrary lib) {
     return "unknown";
 }
 
+// Print the full usage/help string including all optional flags. Using a raw
+// string literal keeps quoting tractable for a multi-line block.
 static void usage() {
     std::cerr <<
 R"(Usage:
@@ -130,6 +180,10 @@ Notes:
 )";
 }
 
+// Return true iff a single interval in `merged` fully covers zone `z`. `merged`
+// must already be sorted and gap-merged. Terminates on the first interval that
+// could possibly contain `z.start`: if that interval starts after `z.start`
+// there is a gap, otherwise the decision reduces to end >= z.end.
 static bool zone_fully_covered(const Zone& z, const std::vector<std::pair<int32_t,int32_t>>& merged) {
     for (const auto& iv : merged) {
         if (iv.second < z.start) continue;
@@ -139,6 +193,8 @@ static bool zone_fully_covered(const Zone& z, const std::vector<std::pair<int32_
     return false;
 }
 
+// Encode a raw phred quality value into the ASCII phred+33 FASTQ representation.
+// Clamps at 93 so the output stays printable ('!'..'~').
 static inline char phred33(uint8_t q) {
     if (q > 93) q = 93;
     return (char)(q + 33);
@@ -146,6 +202,9 @@ static inline char phred33(uint8_t q) {
 
 // Safe codon index: avoids negative integer division weirdness.
 // Returns -1 if (pos-1) is before the first codon start based on codon_frame.
+// Guarding against the negative-dividend case keeps the function safe even
+// when the reference position falls in the short pre-frame prefix (e.g.
+// codon_frame=2 means positions 1-2 have no codon).
 static inline int32_t codon_index_0based(int32_t pos_1based, int codon_frame, int32_t n_codons) {
     int32_t x = pos_1based - 1; // 0-based base index
     if (x < codon_frame) return -1;
@@ -154,14 +213,24 @@ static inline int32_t codon_index_0based(int32_t pos_1based, int codon_frame, in
     return idx;
 }
 
+// Inverse of codon_index_0based: returns the 1-based reference position of the
+// first base in codon `codon_idx_0based` under the given frame.
 static inline int32_t codon_start_1based(int32_t codon_idx_0based, int codon_frame) {
     return codon_frame + 1 + (codon_idx_0based * 3);
 }
 
+// True iff `c` is one of the four canonical DNA bases (uppercase only; caller
+// is expected to have already folded case).
 static inline bool is_acgt(char c) {
     return c == 'A' || c == 'C' || c == 'G' || c == 'T';
 }
 
+// Validate that a mutated codon conforms to the configured library design.
+// For NNN every codon is accepted. For NNK every one of the three codon bases
+// must (a) live inside a DMS zone, (b) have been observed in the read at
+// passing base quality (zone_hq_seen), (c) be a canonical ACGT base, and
+// (d) the 3rd base must be G or T (the defining NNK constraint). Any violated
+// condition returns false so the caller can reject the whole read.
 static bool mutated_codon_matches_library(
     const std::string& corrected_seq,
     const std::vector<uint8_t>& zone_mask,
@@ -173,6 +242,8 @@ static bool mutated_codon_matches_library(
     if (library == MutantCodonLibrary::NNN) return true;
     if (codon_start < 1 || codon_start + 2 > ref_len) return false;
 
+    // All three positions must be inside a DMS zone AND observed at HQ;
+    // otherwise we cannot trust the 3rd-base constraint at this codon.
     for (int32_t p = codon_start; p <= codon_start + 2; ++p) {
         if (!zone_mask[p - 1] || !zone_hq_seen[p - 1]) return false;
     }
@@ -182,6 +253,7 @@ static bool mutated_codon_matches_library(
     char b3 = corrected_seq[codon_start + 1];
     if (!is_acgt(b1) || !is_acgt(b2) || !is_acgt(b3)) return false;
 
+    // NNK constraint: 3rd base must be G or T.
     return b3 == 'G' || b3 == 'T';
 }
 
@@ -203,6 +275,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Defaults for every optional flag. -1 on min_fw_bq is a sentinel meaning
+    // "fall back to min_bq if the user doesn't override it"; wt_q=40 gives
+    // WT-filled bases a plausible Illumina-quality-like phred so downstream
+    // tools do not mistake them for sequencing noise.
     int codon_frame = 0;
     int max_indel_events = 0;
     int max_indel_bases  = 0;
@@ -245,6 +321,9 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Frame must live in {0,1,2}; silently clamp rather than error so that a
+    // downstream wrapper script passing an arithmetic expression can not crash
+    // the pipeline on a minor miscalculation.
     if (codon_frame < 0) codon_frame = 0;
     if (codon_frame > 2) codon_frame = 2;
 
@@ -254,12 +333,16 @@ int main(int argc, char** argv) {
     if (wt_q > 93) wt_q = 93;
 
     // Load reference FASTA: require exactly ONE contig, and use it.
+    // fai_load auto-generates or refreshes the .fai sidecar if missing.
     faidx_t* fai = fai_load(ref_fa.c_str());
     if (!fai) {
         std::cerr << "Failed to load reference FASTA index. Run: samtools faidx " << ref_fa << "\n";
         return 2;
     }
 
+    // Single-contig constraint. The tool assumes one amplicon reference and
+    // uses zone coordinates relative to it; multi-contig input would make the
+    // zone-bounds check ambiguous.
     int nseq = faidx_nseq(fai);
     if (nseq != 1) {
         std::cerr << "Reference FASTA must contain exactly 1 contig, but found " << nseq << ".\n";
@@ -275,6 +358,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // htslib returns int64_t lengths; the DMS logic below uses int32_t for
+    // positions so reject any reference longer than INT32_MAX up front rather
+    // than risk silent overflow in codon math.
     int64_t ref_len64 = faidx_seq_len(fai, contig);
     if (ref_len64 <= 0) {
         std::cerr << "Failed to get reference length for contig: " << contig << "\n";
@@ -301,7 +387,9 @@ int main(int argc, char** argv) {
     std::string ref_full = to_upper(std::string(ref_c, ref_c + fetched_len));
     free(ref_c);
 
-    // Zone mask across reference
+    // 0-based boolean mask: zone_mask[p] == 1 iff reference position p+1
+    // lives inside any DMS zone. Flattening here keeps the hot CIGAR loop's
+    // zone test to an O(1) array lookup per base.
     std::vector<uint8_t> zone_mask(ref_len, 0);
     for (const auto& z : zones) {
         if (z.start < 1 || z.end > ref_len) {
@@ -313,10 +401,13 @@ int main(int argc, char** argv) {
         for (int32_t p = z.start; p <= z.end; p++) zone_mask[p - 1] = 1;
     }
 
+    // zones is already sorted in parse_zones, so first/last are by position.
+    // The default coverage rule only requires both endpoints, not every zone.
     Zone first_zone = zones.front();
     Zone last_zone  = zones.back();
 
-    // Precompute zone positions (1-based) once
+    // Precompute zone positions (1-based) once. Enumerating zone_pos avoids
+    // re-scanning zone_mask for every read during variant-key construction.
     std::vector<int32_t> zone_pos;
     zone_pos.reserve(ref_len);
     for (int32_t p = 1; p <= ref_len; ++p) {
@@ -367,6 +458,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // If --out-counts is set we accumulate per-variant_key counts; otherwise
+    // we only track which keys appeared, purely to report `unique_variants` in
+    // the stderr summary. Reserve 200k buckets to front-load allocation on a
+    // typical thesis-scale dataset (~100k-200k distinct DMS variants).
     const bool want_table = !out_counts.empty();
     std::unordered_map<std::string, uint64_t> counts;
     std::unordered_set<std::string> unique_keys;
@@ -400,9 +495,16 @@ int main(int argc, char** argv) {
     uint64_t sum_zone_codons_compared = 0;
     uint64_t sum_fw_codons_compared   = 0;
 
+    // Number of complete codons fitting in the reference (ceil division).
     const int32_t n_codons = (ref_len + 2) / 3;
 
-    // Codon markers for mismatches (zone and framework)
+    // "Epoch-stamped" visited arrays. Instead of clearing a size-n_codons
+    // vector per read, we store a per-codon counter and compare against the
+    // current epoch; a codon is "seen this read" iff slot == epoch. Bumping
+    // epoch at the start of each read is O(1); we only refill the array when
+    // epoch would wrap to 0. One pair of arrays per category: DMS-zone
+    // mismatches, framework mismatches, DMS-zone codons-compared denominator,
+    // framework codons-compared denominator.
     std::vector<uint32_t> codon_seen_mis((size_t)n_codons, 0);
     uint32_t epoch_mis = 1;
 
@@ -419,13 +521,21 @@ int main(int argc, char** argv) {
     while (sam_read1(in, hdr, b) >= 0) {
         n_total++;
 
+        // Primary-alignment gate: drop unmapped / secondary / supplementary
+        // records. Equivalent to samtools view -F 0x904. These records either
+        // carry no usable sequence or duplicate bases already counted against
+        // the primary alignment.
         if (b->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY)) continue;
         if (b->core.tid != contig_tid) { n_skip_tid++; continue; }
         if ((int)b->core.qual < min_mapq) { n_fail_mapq++; continue; }
 
         uint32_t* cigar = bam_get_cigar(b);
 
-        // INDEL assessment
+        // INDEL assessment. Walk the CIGAR once to count insertion+deletion
+        // events and bases, and reject the read if either exceeds its budget.
+        // The inner break exits early once the budgets are exceeded; the
+        // second check is then just a formality that still returns the
+        // early-exit state correctly.
         int indel_events = 0;
         int indel_bases = 0;
         for (uint32_t i = 0; i < b->core.n_cigar; i++) {
@@ -442,13 +552,19 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        // coverage intervals + corrected seq/qual
+        // Start CIGAR walk. refpos tracks the 1-based reference coordinate,
+        // readpos the 0-based offset into the packed read sequence. `cov`
+        // collects M/=/X intervals so we can later check zone coverage.
         int32_t refpos = b->core.pos + 1; // 1-based
         int32_t readpos = 0;
 
         std::vector<std::pair<int32_t,int32_t>> cov;
         cov.reserve(b->core.n_cigar);
 
+        // Pre-fill the corrected FASTQ with the reference and a uniform
+        // WT quality string. Only DMS-zone positions with HQ read bases will
+        // overwrite these defaults below; outside zones the reference always
+        // wins, which is exactly the DMS-aware polishing contract.
         std::string corrected_seq = ref_full; // WT baseline
         std::string corrected_qual;
         corrected_qual.assign(ref_len, phred33((uint8_t)wt_q));
@@ -464,7 +580,9 @@ int main(int argc, char** argv) {
         uint32_t read_zone_codons_cmp = 0;
         uint32_t read_fw_codons_cmp   = 0;
 
-        // epochs for framework mismatch codon counting
+        // Assign a fresh epoch id per read for each codon-tracking category.
+        // On wrap-around (epoch hits 0 after increment) the slots must be
+        // zeroed so the next epoch's comparisons start from a clean state.
         uint32_t this_epoch_fw_mis = epoch_fw_mis++;
         if (epoch_fw_mis == 0) {
             std::fill(codon_seen_fw_mis.begin(), codon_seen_fw_mis.end(), 0);
@@ -487,7 +605,11 @@ int main(int argc, char** argv) {
             this_epoch_fw_cmp = epoch_fw_cmp++;
         }
 
-        // Walk CIGAR
+        // Walk CIGAR. Each op advances refpos/readpos according to SAM spec:
+        //   M/=/X consume both; record coverage and inspect every aligned base
+        //   I/S    consume read only  (insertion / soft clip)
+        //   D/N    consume ref only   (deletion / ref skip)
+        //   H/P    consume neither    (hard clip / pad)
         for (uint32_t ci = 0; ci < b->core.n_cigar; ci++) {
             int op  = bam_cigar_op(cigar[ci]);
             int len = bam_cigar_oplen(cigar[ci]);
@@ -510,13 +632,19 @@ int main(int argc, char** argv) {
                         continue;
                     }
 
-                    // Framework region: outside zones
+                    // Framework region: outside DMS zones. We measure noise
+                    // here against the RAW read base (rb) vs. reference, not
+                    // against corrected_seq (which is forced WT outside zones,
+                    // so would trivially report zero framework mismatches).
                     if (!zone_mask[rp - 1]) {
                         if (rb != 'N' && (int)rq >= min_fw_bq) {
                             // denominator: bases compared
                             read_fw_bases_cmp++;
 
-                            // denominator: codons compared (once per read per codon)
+                            // denominator: codons compared (once per read per codon).
+                            // The epoch check ensures a single codon contributes
+                            // exactly one unit to the denominator even if all
+                            // three of its bases pass the filter.
                             int32_t codon_idx = codon_index_0based(rp, codon_frame, n_codons);
                             if (codon_idx >= 0) {
                                 uint32_t &slot_cmp = codon_seen_fw_cmp[(size_t)codon_idx];
@@ -526,11 +654,12 @@ int main(int argc, char** argv) {
                                 }
                             }
 
-                            // mismatch
+                            // mismatch against the reference base (noise signal)
                             if (rb != refb) {
                                 read_fw_nt_mis++;
 
-                                // codon mismatch (once per codon per read)
+                                // codon mismatch (once per codon per read) —
+                                // same epoch pattern as the denominator.
                                 if (codon_idx >= 0) {
                                     uint32_t &slot_mis = codon_seen_fw_mis[(size_t)codon_idx];
                                     if (slot_mis != this_epoch_fw_mis) {
@@ -542,7 +671,11 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // Mutational region: inside zones
+                    // Mutational region: inside DMS zones. Here we BOTH
+                    // accumulate the per-read zone denominators AND transfer
+                    // the HQ read base into corrected_seq, flagging the
+                    // position in zone_hq_seen so NNK codon validation later
+                    // knows this position was observed at passing quality.
                     if (zone_mask[rp - 1]) {
                         if (rb != 'N' && (int)rq >= min_bq) {
                             // denominator: bases compared
@@ -570,17 +703,21 @@ int main(int argc, char** argv) {
                 readpos += len;
             }
             else if (op == BAM_CINS || op == BAM_CSOFT_CLIP) {
-                readpos += len;
+                readpos += len;  // consumes read only
             }
             else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
-                refpos += len;
+                refpos += len;   // consumes ref only
             }
             else if (op == BAM_CHARD_CLIP || op == BAM_CPAD) {
-                // nothing
+                // consumes neither; no advancement
             }
         }
 
-        // merge coverage intervals
+        // Merge M/=/X intervals into a minimal set of disjoint reference
+        // spans so zone_fully_covered can short-circuit. Intervals that
+        // touch (gap == 1 base, i.e. a.second+1 == b.first) are also merged,
+        // which correctly treats a single-base deletion within coverage as
+        // "still covered on both sides".
         if (cov.empty()) { n_fail_coverage++; continue; }
         std::sort(cov.begin(), cov.end());
         std::vector<std::pair<int32_t,int32_t>> merged;
@@ -590,6 +727,11 @@ int main(int argc, char** argv) {
             else merged.back().second = std::max(merged.back().second, iv.second);
         }
 
+        // Coverage rule. Default: demand full coverage only of the first and
+        // last zone (by position) — a read that spans the whole DMS region
+        // necessarily spans the intermediate zones too for the thesis
+        // amplicon. --require-all-zones is stricter and verifies each zone
+        // independently.
         bool ok = true;
         if (require_all_zones) {
             for (const auto& z : zones) {
@@ -606,6 +748,9 @@ int main(int argc, char** argv) {
         }
 
         // Variant key + mismatch stats (zone-aware, quality-filtered via corrected_seq).
+        // Mismatches at this stage are measured on corrected_seq vs. reference,
+        // so positions that failed the HQ filter left the reference baseline
+        // unchanged and therefore cannot contribute a spurious mismatch.
         uint32_t this_epoch_mis = epoch_mis++;
         if (epoch_mis == 0) {
             std::fill(codon_seen_mis.begin(), codon_seen_mis.end(), 0);
@@ -616,6 +761,10 @@ int main(int argc, char** argv) {
         uint32_t read_nt_mis = 0;
         uint32_t read_codon_mis = 0;
 
+        // Edit tokens are accumulated in 1-based reference order (we iterate
+        // zone_pos ascending). Reserve 8 to cover the typical 0-2 mutations
+        // plus headroom. mutated_codon_indices caches the distinct codon
+        // indices so NNK validation below can skip re-scanning.
         std::vector<std::string> edits;
         edits.reserve(8);
         std::vector<int32_t> mutated_codon_indices;
@@ -649,11 +798,17 @@ int main(int argc, char** argv) {
         }
 
         // Dual-site DMS library: allow at most two mutated codons per passing read.
+        // Above this budget the read is more likely a real multi-mutation or
+        // nanopore noise than the single/dual site the library was designed
+        // to produce; dropping it sharply reduces false-positive variants.
         if (read_codon_mis > 2) {
             n_fail_dual_site++;
             continue;
         }
 
+        // Validate every mutated codon against the configured library design.
+        // For NNK this enforces the "3rd base ∈ {G,T}" constraint on top of
+        // full HQ observation of all three codon bases.
         bool mutant_codons_ok = true;
         for (int32_t codon_idx : mutated_codon_indices) {
             int32_t codon_start = codon_start_1based(codon_idx, codon_frame);
@@ -689,13 +844,18 @@ int main(int argc, char** argv) {
         else if (read_codon_mis == 1) n_pass_1_codon_mut++;
         else n_pass_2_codon_mut++;
 
+        // Sort the edits lexicographically before joining so that reads which
+        // agree on the set of mutations generate identical variant_keys
+        // regardless of the order zone_pos visited their positions.
         std::sort(edits.begin(), edits.end());
         std::string key = join_edits(edits);
 
         if (want_table) counts[key]++;
         else unique_keys.insert(std::move(key));
 
-        // Write corrected FASTQ
+        // Write corrected FASTQ. Header preserves the original qname plus a
+        // minimal set of provenance tags (mapq, contig) useful when eyeballing
+        // the output. Sequence and quality are both exactly ref_len bytes.
         out_fq_stream << "@" << bam_get_qname(b)
                       << " mapq=" << (int)b->core.qual
                       << " contig=" << contig << "\n";
@@ -704,7 +864,9 @@ int main(int argc, char** argv) {
         n_pass++;
     }
 
-    // Write counts TSV
+    // Write counts TSV. Sorted by count descending, with lexicographic
+    // variant_key as a tie-breaker, so the output is deterministic and
+    // human-readable (most-abundant variants at top).
     if (!out_counts.empty()){
         std::vector<std::pair<std::string, uint64_t>> items;
         items.reserve(counts.size());
@@ -760,7 +922,9 @@ int main(int argc, char** argv) {
     std::cerr << "pass_rate=" << (n_total ? (static_cast<double>(n_pass) / n_total) : 0.0) << "\n";
     std::cerr << "unique_variants=" << (want_table ? counts.size() : unique_keys.size()) << "\n";
 
-    // Per-pass-read averages (your original-style stats)
+    // Per-pass-read averages. "Net" values subtract framework (noise) from
+    // DMS (signal) and floor at zero; interpret as the average number of
+    // DMS-specific mismatches per read above the background framework rate.
     double avg_nt_mis = (n_pass ? (double)sum_nt_mismatches / (double)n_pass : 0.0);
     double avg_codon_mis = (n_pass ? (double)sum_codon_mismatches / (double)n_pass : 0.0);
     double avg_fw_nt_mis = (n_pass ? (double)sum_fw_nt_mismatches / (double)n_pass : 0.0);
@@ -784,7 +948,9 @@ int main(int argc, char** argv) {
     std::cerr << "dms_codons_compared=" << sum_zone_codons_compared << "\n";
     std::cerr << "framework_codons_compared=" << sum_fw_codons_compared << "\n";
 
-    // per-base mismatch rates
+    // Per-base mismatch rates: mismatches / bases_compared for each region.
+    // This is the normalised metric reported in the thesis figures and is
+    // independent of read length, unlike the per-read averages above.
     double zone_nt_rate = (sum_zone_bases_compared ? (double)sum_nt_mismatches / (double)sum_zone_bases_compared : 0.0);
     double fw_nt_rate   = (sum_fw_bases_compared   ? (double)sum_fw_nt_mismatches / (double)sum_fw_bases_compared   : 0.0);
     double net_nt_rate  = zone_nt_rate - fw_nt_rate;
@@ -794,7 +960,10 @@ int main(int argc, char** argv) {
     std::cerr << "framework_nt_mismatch_rate_per_base=" << fw_nt_rate << "\n";
     std::cerr << "net_nt_mismatch_rate_per_base=" << net_nt_rate << "\n";
 
-    // per-codon mismatch rates
+    // Per-codon mismatch rates: codon_mismatches / codons_compared, where a
+    // codon is "compared" if at least one base in it passed its region's
+    // quality filter for this read. This is a coarser view of the same
+    // signal, appropriate when the DMS library mutations are codon-scale.
     double zone_codon_rate = (sum_zone_codons_compared ? (double)sum_codon_mismatches / (double)sum_zone_codons_compared : 0.0);
     double fw_codon_rate   = (sum_fw_codons_compared   ? (double)sum_fw_codon_mismatches / (double)sum_fw_codons_compared   : 0.0);
     double net_codon_rate  = zone_codon_rate - fw_codon_rate;
@@ -808,7 +977,9 @@ int main(int argc, char** argv) {
 
     if (!out_counts.empty()) std::cerr << "out_counts=" << out_counts << "\n";
 
-    // Cleanup
+    // Explicit htslib cleanup: bam_destroy1 frees the record allocated by
+    // bam_init1, bam_hdr_destroy frees the parsed header, sam_close flushes
+    // and releases the BAM handle, fai_destroy drops the FAI index.
     bam_destroy1(b);
     bam_hdr_destroy(hdr);
     sam_close(in);
