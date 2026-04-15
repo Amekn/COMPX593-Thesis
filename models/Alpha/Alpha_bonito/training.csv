@@ -1,0 +1,2 @@
+time,duration,epoch,train_loss,validation_loss,validation_mean,validation_median
+2026-03-15 15:16:06.722346,275,1,0.01509319750891796,0.009576637054690057,99.73473074193276,100.0

@@ -939,14 +939,15 @@ PY
 
 # Given a directory that looked like a candidate model (from the row-name
 # search), return the actual Dorado-ready model directory inside it.
-# Checks in order: the wrapper itself (if it has config.toml), a "_v2"
-# suffixed child (used by our fine-tunes), an exact-name child, then any
-# one lone child containing config.toml. Returns 1 on "no match", 2 on
-# ambiguity (caller propagates the status).
+# Checks in order: the wrapper itself (if it has config.toml), a "_dorado"
+# suffixed child (used by our fine-tunes; this is the Bonito-export package
+# that Dorado consumes), an exact-name child, then any one lone child
+# containing config.toml. Returns 1 on "no match", 2 on ambiguity (caller
+# propagates the status).
 resolve_model_dir_from_wrapper() {
   local wrapper_dir=$1
   local row_name=$2
-  local preferred_child="$wrapper_dir/${row_name}_v2"
+  local preferred_child="$wrapper_dir/${row_name}_dorado"
   local exact_child="$wrapper_dir/$row_name"
   local candidates=()
   local candidate

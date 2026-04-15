@@ -26,8 +26,9 @@ __pycache__/
 venv/
 
 # Notebook working directory — large sequencing inputs, intermediate
-# outputs, per-model test artefacts, fine-tuned model weights, and
-# derived cache files are NOT tracked in git.
+# outputs, per-model test artefacts, and derived cache files are NOT
+# tracked in git. (The fine-tuned basecaller checkpoints themselves live
+# under the top-level models/ folder and ARE tracked.)
 src/ipynb/plot/
 
 # Sequencing & ML artefacts (belt-and-braces if staged elsewhere)
@@ -44,3 +45,8 @@ src/ipynb/plot/
 *.pt
 *.pth
 *.onnx
+
+# Bonito raw checkpoints — exceed GitHub's 100 MB per-file limit.
+# The Dorado-ready export under models/<name>/<name>_dorado/ is what we
+# ship; see models/README.md § Excluded artefacts.
+models/**/weights_*.tar

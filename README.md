@@ -26,7 +26,8 @@ COMPX593-Thesis/
 ├── LICENSE               # GPL-3.0
 ├── README.md             # (this file)
 ├── environment/          # Python + external-tool dependency pins
-├── figures/              # Rendered thesis figures (P1–P23, F1–F3, ELISA)
+├── figures/              # Rendered thesis figures (numbered to thesis captions)
+├── models/               # Nine fine-tuned Bonito/Dorado basecaller checkpoints
 ├── reference/            # Fc amplicon reference + DMS-window definition
 ├── src/
 │   ├── bash/             # Pipeline drivers and table generators
@@ -38,9 +39,10 @@ COMPX593-Thesis/
 └── tables/               # Summary CSVs consumed by the notebook
 ```
 
-Sequencing inputs (POD5, BAM, FASTQ), per-model test outputs, the nine
-fine-tuned Bonito model weights, and derived caches are **not** tracked in
-git (see [Data availability](#data-availability) below).
+Sequencing inputs (POD5, BAM, FASTQ), per-model test outputs, and derived
+caches are **not** tracked in git (see [Data availability](#data-availability)
+below). The nine fine-tuned basecaller checkpoints themselves are tracked
+under `models/` — see `models/README.md` for per-checkpoint layout.
 
 ## Building the C++ tools
 
@@ -89,11 +91,13 @@ External bioinformatics tools expected on `PATH`: `samtools`, `minimap2`,
 2. Install the Python environment.
 3. Obtain the sequencing inputs and per-model outputs (see
    [Data availability](#data-availability)) and place them under
-   `src/ipynb/plot/{data,test,model}` (paths resolved relative to the repo
-   root by the notebook's `ROOT` variable).
+   `src/ipynb/plot/{data,test}` (paths resolved relative to the repo root
+   by the notebook's `ROOT` variable). The fine-tuned checkpoints live in
+   `models/` and are consumed by `src/bash/GenerateTestCsv.sh` when
+   regenerating `tables/test.csv`.
 4. Open `src/ipynb/plot.ipynb` and run all cells. Rendered SVGs are written
-   into `figures/` with filenames matching the panel titles printed in the
-   thesis (e.g. `P1 - Read retention across filtering stages by dataset.svg`).
+   into `figures/` with filenames matching the thesis caption numbers
+   (e.g. `figure_10_read_retention_by_dataset.svg`).
 5. Summary tables consumed by the notebook live in `tables/`:
    `model.csv`, `data.csv`, `test.csv`, `correlation.csv`, `mutation.csv`,
    `umi.csv`.
@@ -111,17 +115,23 @@ External bioinformatics tools expected on `PATH`: `samtools`, `minimap2`,
 | §3.2–3.3 Per-model metrics             | `src/bash/CalcStats.sh`, `GenerateTestCsv.sh` → `tables/test.csv`                                                       |
 | §3.4 Variant concordance               | `src/bash/GenerateCorrelationCsv.sh` → `tables/correlation.csv`                                                        |
 | All figures & panels                   | `src/ipynb/plot.ipynb` → `figures/*.svg`                                                                               |
+| Fine-tuned checkpoints                 | `models/<family><variant>/{<name>_dorado,<name>_bonito}/`; see `models/README.md`                                      |
 | Reference & DMS windows                | `reference/fc_reference.fa(.fai/.mmi)`, `reference/DMSZones.txt`                                                        |
 
 ## Data availability
 
 The 687 bp Fc amplicon reference and the four DMS window coordinates are
-checked into `reference/`. The raw nanopore POD5s, basecalled FASTQs, BAMs,
-Bonito training arrays, per-model test artefacts, and fine-tuned model
-weights are **excluded from the repository** (see `.gitignore`) because of
-their size. Access can be arranged by contacting the author via the
-thesis submission record held by the University of Waikato School of
-Computing and Mathematical Sciences.
+checked into `reference/`. The nine fine-tuned basecaller checkpoints
+(Dorado-ready exports plus Bonito training records) are checked into
+`models/`; see `models/README.md` for the per-checkpoint layout and the
+list of excluded large artefacts.
+
+The raw nanopore POD5s, basecalled FASTQs, BAMs, Bonito training arrays,
+per-model test artefacts, and the Bonito `weights_1.tar` checkpoints are
+**excluded from the repository** (see `.gitignore`) because of their
+size. Access can be arranged by contacting the author via the thesis
+submission record held by the University of Waikato School of Computing
+and Mathematical Sciences.
 
 ## License
 
