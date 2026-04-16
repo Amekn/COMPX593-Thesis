@@ -1,6 +1,6 @@
 # COMPX593 Thesis Toolkit
 
-Source code, summary tables, figures, and reference inputs used for the
+Source code, summary tables, figures, and reference sequence used for the
 COMPX593 Master's thesis *"Fine-Tuning Oxford Nanopore Basecalling Models to Enable High-Fidelity Single-Read Variant Calling in Antibody Libraries"* (University
 of Waikato, 2026).
 
@@ -15,7 +15,7 @@ The repository bundles:
 - A single Jupyter notebook (`src/ipynb/plot.ipynb`) that renders every
   figure, panel, and summary table used in the thesis body and appendices.
 - Summary tables, the Fc reference, and all rendered figure SVGs required
-  to re-verify the published results.
+  to verify against the published results.
 
 ## Repository Layout
 
@@ -38,7 +38,7 @@ COMPX593-Thesis/
 └── tables/               # Summary CSVs consumed by the notebook
 ```
 
-Sequencing inputs (POD5, BAM, FASTQ), per-model test outputs, and derived
+Sequencing inputs (POD5, BAM, FASTQ), test outputs, and derived
 caches are **not** tracked in git (see [Data availability](#data-availability)
 below). The nine fine-tuned basecaller checkpoints themselves are tracked
 under `models/` — see `models/README.md` for per-checkpoint layout.
@@ -88,7 +88,7 @@ External bioinformatics tools expected on `PATH`: `samtools`, `minimap2`,
 
 1. Build the C++ tools as described above.
 2. Install the Python environment.
-3. Obtain the sequencing inputs and per-model outputs (see
+3. Obtain the sequencing inputs and model outputs (see
    [Data availability](#data-availability)) and place them under
    `src/ipynb/plot/{data,test}` (paths resolved relative to the repo root
    by the notebook's `ROOT` variable). The fine-tuned checkpoints live in
@@ -96,8 +96,7 @@ External bioinformatics tools expected on `PATH`: `samtools`, `minimap2`,
    regenerating `tables/test.csv`.
 4. Open `src/ipynb/plot.ipynb` and run all cells. Rendered SVGs are written
    into `figures/` with filenames matching the thesis caption numbers
-   (e.g. `figure_10_read_retention_by_dataset.svg`).
-5. Summary tables consumed by the notebook live in `tables/`:
+5. Summary tables used by the notebook live in `tables/`:
    `model.csv`, `data.csv`, `test.csv`, `correlation.csv`, `mutation.csv`,
    `umi.csv`.
 
@@ -120,8 +119,8 @@ External bioinformatics tools expected on `PATH`: `samtools`, `minimap2`,
 ## Data availability
 
 The 687 bp Fc amplicon reference and the four DMS window coordinates are
-checked into `reference/`. The nine fine-tuned basecaller checkpoints
-(Dorado-ready exports plus Bonito training records) are checked into
+available in `reference/`. The nine fine-tuned basecaller checkpoints
+(Dorado ready exports plus Bonito training records) are checked into
 `models/`; see `models/README.md` for the per-checkpoint layout and the
 list of excluded large artefacts.
 
