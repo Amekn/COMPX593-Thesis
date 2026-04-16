@@ -16,15 +16,15 @@ Each model is identified by `<family><variant>`:
 
 | Variant | Training corpus                         | `min_accuracy_save_ctc` |
 |---------|-----------------------------------------|--------------------------|
-| (base)  | Full POD5 (length-only filtering)       | 0                        |
-| QCL     | Quality-control low stringency pool     | 0                        |
-| QCH     | Quality-control high stringency pool    | 0.99                     |
+| (base)  | Full POD5 (no filtering)                | 0                        |
+| QCL     | Low Quality-control (filtering) subset  | 0                        |
+| QCH     | High Quality-control (filtering) subset | 0.99                     |
 
 The nine resulting checkpoints are: `Alpha`, `AlphaQCL`, `AlphaQCH`,
 `Beta`, `BetaQCL`, `BetaQCH`, `Gamma`, `GammaQCL`, `GammaQCH`.
 
 Per-model training statistics (chunk counts, learning rate, loss, validation
-mean/median) are tabulated in `tables/model.csv`.
+mean/median) are saved in `tables/model.csv`.
 
 ## Excluded artefacts
 
@@ -33,17 +33,15 @@ Two classes of Bonito artefact are **not** checked in:
 - `weights_1.tar` (~315 MB per model) exceeds GitHub's 100 MB per-file
   push limit and has been removed from each `<name>_bonito/` folder. The
   Dorado-ready package under `<name>_dorado/` is a complete, self-contained
-  runtime equivalent, so inference reproducibility is preserved.
+  runtime equivalent available for inference.
 - `data/` training-array directories (`basecalls.bam`, `chunks.npy`,
   `references.npy`, `reference_lengths.npy`, `basecalls_summary.tsv`) are
   excluded for size. They can be regenerated from the raw POD5s via
   `src/bash/DMSPolishing.sh` plus the helpers in `src/python/`
   (`Pod5Splitter.py`, `Pod5Merger.py`, `MergeNumpy.py`).
 
-Access to the original `weights_1.tar` checkpoints and training arrays —
-needed only to resume Bonito fine-tuning or to re-export the Dorado
-package — follows the same path as the raw sequencing data (see the
-top-level `README.md` § Data availability).
+Access to the original `weights_1.tar` checkpoints and training arrays are
+needed only to resume Bonito fine-tuning or to re-export Dorado models (see the top-level `README.md` § Data availability).
 
 ## Folder layout
 
