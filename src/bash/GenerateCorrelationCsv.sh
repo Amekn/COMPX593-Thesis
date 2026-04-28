@@ -504,7 +504,7 @@ main() {
   local variant_files=()
   while IFS= read -r -d '' row_line; do
     variant_files+=("$row_line")
-  done < <(find "$source_dir" -type f -name '*.variants.tsv' -print0)
+  done < <(find "$source_dir" -type d -name '*.failed_*' -prune -o -type f -name '*.variants.tsv' -print0)
   (( ${#variant_files[@]} > 0 )) || die "No *.variants.tsv files were found under $source_dir"
 
   local ground_truth_path

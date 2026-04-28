@@ -1015,7 +1015,7 @@ resolve_row_source() {
 
   while IFS= read -r match_path; do
     matches+=("$match_path")
-  done < <(find "$source_dir" \( -type f -o -type d \) -name "$row_name" -print)
+  done < <(find "$source_dir" \( -type f -o -type d -o -type l \) -name "$row_name" -print)
 
   if (( ${#matches[@]} > 0 )); then
     for match_path in "${matches[@]}"; do
