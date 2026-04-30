@@ -27,7 +27,7 @@ struct ConcordanceMetrics {
     std::size_t union_haplotypes = 0;           // Haplotypes above threshold in either store.
     double exact_overlap_mass = 0.0;            // Fraction of source mass whose keys also appear in ground truth.
     double weighted_jaccard = 0.0;              // Count-weighted Jaccard similarity across the union.
-    double jensen_shannon_similarity = 0.0;     // 1 - sqrt(JSD) on normalised count distributions.
+    double jensen_shannon_similarity = 0.0;     // 1 - JSD/log(2) on normalised count distributions.
     double top100_spearman = 0.0;               // Spearman rank correlation on the ground-truth top-100 haplotypes.
 };
 
